@@ -223,7 +223,7 @@ Url          : $($Deployment.Url)
     # Ensure the parent directory exists. The containing folder of tools/
     # normally already exists, but creating it is cheap and avoids races
     # when the script is run from a fresh clone.
-    $dir = Split-Path -LiteralPath $resolvedFile -Parent
+    $dir = Split-Path -Path $resolvedFile -Parent
     if ($dir -and -not (Test-Path -LiteralPath $dir)) {
         New-Item -ItemType Directory -LiteralPath $dir -Force | Out-Null
     }
