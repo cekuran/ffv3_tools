@@ -1,18 +1,27 @@
 #requires -Version 7
 <#
 .SYNOPSIS
-    Lists Google Apps Script deployments of the backend project and rewrites
-    the API_URL constant in frontend/Index.html with the user-selected one.
+    Manages Google Apps Script deployments for the backend project.
 
 .DESCRIPTION
-    Runs `clasp deployments` from the backend folder, parses each line into
-    DeploymentId / Version / Description and shows an interactive arrow-key
-    picker (Up/Down to move, Enter to select, Esc to cancel, Home/End to
-    jump). After confirmation it updates:
+    Two actions are available and chosen interactively from a keyboard
+    picker (Up/Down to move, Enter to select, Esc to cancel):
 
-        const API_URL = 'https://script.google.com/macros/s/<ID>/exec';
+      1. Update API_URL in frontend/Index.html: runs `clasp deployments`,
+         parses each line into DeploymentId / Version / Description and
+         shows an interactive arrow-key picker. After confirmation it
+         rewrites:
 
-    inside frontend/Index.html, preserving the rest of the file.
+             const API_URL = 'https://script.google.com/macros/s/<ID>/exec';
+
+         inside frontend/Index.html, preserving the rest of the file.
+
+      2. Deploy a new Apps Script version: runs `clasp push` followed by
+         `clasp deploy -d <description>`, then shows the resulting
+         deployment (id and description) and writes it to release_info.txt.
+
+    When -Description is supplied on the command line the picker is
+    skipped and the deploy action runs directly.
 
 .PARAMETER BackendPath
     Path to the clasp project folder (must contain .clasp.json).
@@ -29,20 +38,31 @@
     folder). The file is always (re)generated and any existing file at the
     target path is overwritten.
 
+.PARAMETER Description
+    Description for the new Apps Script deployment created by the deploy
+    action. When provided the script skips the main menu and runs the
+    deploy action directly.
+
 .PARAMETER WhatIf
-    If set, performs a dry-run: lists deployments, lets you pick, and
-    prints the resulting URL but never modifies any file.
+    If set, performs a dry-run. For the update action it lists
+    deployments, lets you pick, and prints the resulting URL but never
+    modifies any file. For the deploy action it prints the clasp
+    commands that would run without running them.
 
 .EXAMPLE
     pwsh ./tools/Set-ApiDeployment.ps1
 .EXAMPLE
     pwsh ./tools/Set-ApiDeployment.ps1 -WhatIf
+.EXAMPLE
+    pwsh ./tools/Set-ApiDeployment.ps1 -Description 'Add CSV export'
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [string] $BackendPath = (Join-Path $PSScriptRoot '..' 'backend'),
     [string] $FrontendFile = (Join-Path $PSScriptRoot '..' 'frontend' 'Index.html'),
-    [string] $ReleaseInfoFile = (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'release_info.txt')
+    [string] $ReleaseInfoFile = (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'release_info.txt'),
+    [ValidateNotNullOrEmpty()]
+    [string] $Description
 )
 
 $ErrorActionPreference = 'Stop'
@@ -92,6 +112,139 @@ function Get-Deployments {
     return ,$items
 }
 
+function Get-DeploymentsJson {
+    [CmdletBinding()]
+    param([string] $Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Backend path not found: $Path"
+    }
+    if (-not (Get-Command clasp -ErrorAction SilentlyContinue)) {
+        throw "clasp CLI is not installed or not on PATH. Install with: npm i -g @google/clasp"
+    }
+
+    Push-Location -LiteralPath $Path
+    try {
+        $raw = & clasp list-deployments --json 2>&1
+        $exit = $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+    }
+    if ($exit -ne 0) {
+        throw "clasp list-deployments failed (exit $exit):`n$raw"
+    }
+
+    # clasp may emit the JSON as a single string or across multiple lines
+    # (when stderr is merged via 2>&1). Stitch it back together.
+    $jsonText = ($raw | Where-Object { $_ -is [string] }) -join "`n"
+    if ([string]::IsNullOrWhiteSpace($jsonText)) {
+        return @()
+    }
+
+    $parsed = $jsonText | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $parsed) {
+        return @()
+    }
+
+    # JSON shape may be a flat array OR an object with a "deployments" array;
+    # clasp has shipped both across releases.
+    if ($parsed -is [pscustomobject] -and $parsed.PSObject.Properties['deployments']) {
+        $list = @($parsed.deployments)
+    } else {
+        $list = @($parsed)
+    }
+    if ($list.Count -eq 0) {
+        return @()
+    }
+
+    $items = foreach ($entry in $list) {
+        if ($null -eq $entry) { continue }
+
+        # Property names have varied across clasp releases. Probe each
+        # candidate and take the first one that actually exists.
+        $id = $entry.deploymentId
+        if ($null -eq $id) { $id = $entry.id }
+        if ($null -eq $id) { $id = $entry.deployment_id }
+        if ([string]::IsNullOrWhiteSpace($id)) { continue }
+
+        $desc = $entry.description
+        if ($null -eq $desc) { $desc = $entry.desc }
+        if ($null -eq $desc) { $desc = '' }
+
+        $ver = $entry.versionNumber
+        if ($null -eq $ver) { $ver = $entry.version_number }
+        if ($null -eq $ver) { $ver = $entry.version }
+
+        [pscustomobject]@{
+            DeploymentId  = [string] $id
+            Description   = [string] $desc
+            VersionNumber = $ver   # $null for @HEAD entries
+            Url           = "https://script.google.com/macros/s/$id/exec"
+        }
+    }
+    return ,@($items)
+}
+
+function Get-LatestDeployment {
+    [CmdletBinding()]
+    param([string] $Path)
+
+    # Always normalize to a single shape so the caller can rely on
+    # DeploymentId / VersionNumber / Description regardless of which
+    # clasp command produced the data.
+    $normalized = New-Object System.Collections.Generic.List[object]
+
+    # Preferred path: `clasp list-deployments --json` (clasp 3.x).
+    # If it works we get structured {deploymentId, versionNumber, description}.
+    try {
+        $jsonItems = @(Get-DeploymentsJson -Path $Path)
+        foreach ($item in $jsonItems) {
+            $ver = $item.VersionNumber
+            $normalized.Add([pscustomobject]@{
+                DeploymentId  = [string] $item.DeploymentId
+                VersionNumber = if ($null -eq $ver) { $null } else { [int]$ver }
+                Description   = if ($null -eq $item.Description) { '' } else { [string]$item.Description }
+            })
+        }
+    }
+    catch {
+        Write-Verbose ("JSON listing failed: {0}" -f $_.Exception.Message)
+    }
+
+    # Fallback: text-mode `clasp deployments` (works on clasp 2.x and any
+    # environment where --json is not supported or returns nothing useful).
+    if ($normalized.Count -eq 0) {
+        try {
+            $textItems = @(Get-Deployments -Path $Path)
+            foreach ($item in $textItems) {
+                $verStr = [string] $item.Version
+                $ver = if ($verStr -match '^\d+$') { [int]$verStr } else { $null }
+                $normalized.Add([pscustomobject]@{
+                    DeploymentId  = [string] $item.Id
+                    VersionNumber = $ver
+                    Description   = if ($null -eq $item.Description) { '' } else { [string]$item.Description }
+                })
+            }
+        }
+        catch {
+            Write-Verbose ("Text listing failed: {0}" -f $_.Exception.Message)
+        }
+    }
+
+    if ($normalized.Count -eq 0) {
+        return $null
+    }
+
+    # @HEAD has VersionNumber == $null. Prefer the highest real version,
+    # but if only @HEAD exists show it so the user sees something useful.
+    $numbered = @($normalized | Where-Object { $null -ne $_.VersionNumber })
+    if ($numbered.Count -gt 0) {
+        return @($numbered | Sort-Object -Property VersionNumber -Descending)[0]
+    }
+    return $normalized[0]
+}
+
 function Show-Picker {
     [CmdletBinding()]
     param(
@@ -107,6 +260,15 @@ function Show-Picker {
     $sel = 0
     $top = [Console]::CursorTop
     $hostUi = $Host.UI.RawUI
+
+    # The picker renders 3 header lines plus one row per item plus one
+    # trailing cursor position. When the cursor is already near the
+    # bottom of a small console, SetCursorPosition calls would throw
+    # "must be less than the buffer size". Clamp $top so every row we
+    # touch stays inside the buffer.
+    $rowsNeeded = 3 + $Items.Count + 1
+    $maxTop = [Math]::Max(0, $hostUi.BufferHeight - $rowsNeeded)
+    $top = [Math]::Min($top, $maxTop)
 
     function Render {
         param($Items, [int] $Sel, [int] $Top, [string] $Title)
@@ -160,6 +322,70 @@ function Show-Picker {
         # of the script or the user's shell. Clear-Host is the canonical
         # PowerShell way to do this and works on both Windows Terminal and
         # the classic console host.
+        [Console]::ResetColor()
+        Clear-Host
+        [Console]::SetCursorPosition(0, 0)
+    }
+}
+
+function Show-MainMenu {
+    # Top-level action picker. Returns the chosen action key
+    # ('Update' or 'Deploy') or $null if the user cancels.
+    $options = @(
+        [pscustomobject]@{ Key = 'Update'; Label = 'Update API_URL in Index.html' }
+        [pscustomobject]@{ Key = 'Deploy'; Label = 'Deploy a new Apps Script version' }
+    )
+
+    $sel = 0
+    $top = [Console]::CursorTop
+    $hostUi = $Host.UI.RawUI
+
+    # Same buffer-height clamp as Show-Picker: ensure every row we touch
+    # is inside the console buffer so SetCursorPosition does not throw.
+    $rowsNeeded = 3 + $options.Count + 1
+    $maxTop = [Math]::Max(0, $hostUi.BufferHeight - $rowsNeeded)
+    $top = [Math]::Min($top, $maxTop)
+
+    function Render {
+        param($Opts, [int] $Sel, [int] $Top)
+        [Console]::SetCursorPosition(0, $Top)
+        $width = [Math]::Max(20, $hostUi.BufferWidth - 1)
+        $clearLine = ' ' * $width
+
+        Write-Host 'Choose an action:' -ForegroundColor Cyan
+        Write-Host 'Use Up/Down to move, Enter to select, Esc to cancel.'
+        Write-Host ''
+        for ($i = 0; $i -lt $Opts.Count; $i++) {
+            [Console]::SetCursorPosition(0, $Top + 3 + $i)
+            Write-Host $clearLine -NoNewline
+            [Console]::SetCursorPosition(0, $Top + 3 + $i)
+            $prefix = if ($i -eq $Sel) { '> ' } else { '  ' }
+            $row = "$prefix$($Opts[$i].Label)"
+            if ($i -eq $Sel) {
+                Write-Host $row -ForegroundColor Black -BackgroundColor Cyan
+            } else {
+                Write-Host $row
+            }
+        }
+        [Console]::ResetColor()
+        [Console]::SetCursorPosition(0, $Top + 3 + $Opts.Count)
+    }
+
+    Render -Opts $options -Sel $sel -Top $top
+    try {
+        while ($true) {
+            $key = [Console]::ReadKey($true)
+            switch ($key.Key) {
+                'UpArrow'   { $sel = ($sel - 1 + $options.Count) % $options.Count }
+                'DownArrow' { $sel = ($sel + 1) % $options.Count }
+                'Enter'     { return $options[$sel].Key }
+                'Escape'    { return $null }
+                default     { continue }
+            }
+            Render -Opts $options -Sel $sel -Top $top
+        }
+    }
+    finally {
         [Console]::ResetColor()
         Clear-Host
         [Console]::SetCursorPosition(0, 0)
@@ -238,36 +464,175 @@ Url          : $($Deployment.Url)
     [System.IO.File]::WriteAllText($resolvedFile, $content, $utf8NoBom)
 }
 
-try {
-    $items = Get-Deployments -Path $BackendPath
-    if (-not $items -or $items.Count -eq 0) {
-        Write-Host "No deployments available for $BackendPath." -ForegroundColor Yellow
-        exit 1
+function Invoke-PushDeployment {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] [string] $Description
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Backend path not found: $Path"
+    }
+    if (-not (Get-Command clasp -ErrorAction SilentlyContinue)) {
+        throw "clasp CLI is not installed or not on PATH. Install with: npm i -g @google/clasp"
     }
 
-    if ($items.Count -eq 1) {
-        $choice = $items[0]
-        Write-Host ("Only one deployment found, using {0} ({1})." -f $choice.Version, $choice.Id) -ForegroundColor Yellow
+    # Step 1: push local backend files to Apps Script.
+    if (-not $PSCmdlet.ShouldProcess("$Path (clasp push)", 'Push backend files')) {
+        Write-Host "[WhatIf] Would run: clasp push in $Path" -ForegroundColor DarkGray
     } else {
-        $choice = Show-Picker -Items $items -Title "Apps Script deployments ($BackendPath)"
-        if (-not $choice) {
+        Push-Location -LiteralPath $Path
+        try {
+            $pushOut = & clasp push 2>&1
+            $pushExit = $LASTEXITCODE
+        }
+        finally {
+            Pop-Location
+        }
+        if ($pushExit -ne 0) {
+            throw "clasp push failed (exit $pushExit):`n$pushOut"
+        }
+        Write-Host "Pushed backend files from $Path" -ForegroundColor Green
+    }
+
+    # Step 2: create a new deployment with the given description.
+    if (-not $PSCmdlet.ShouldProcess("$Path (clasp deploy -d '$Description')", 'Deploy new version')) {
+        Write-Host "[WhatIf] Would run: clasp deploy -d '$Description' in $Path" -ForegroundColor DarkGray
+        return $null
+    }
+
+    Push-Location -LiteralPath $Path
+    try {
+        $deployOut = & clasp deploy -d $Description 2>&1
+        $deployExit = $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+    }
+    if ($deployExit -ne 0) {
+        throw "clasp deploy failed (exit $deployExit):`n$deployOut"
+    }
+
+    # Echo clasp's own output so the user sees what happened, then parse the
+    # new deployment id from the trailing "- <id> @<ver> - <desc>" line.
+    foreach ($line in @($deployOut | Where-Object { $_ -is [string] })) {
+        Write-Host $line
+    }
+
+    $newDep = $null
+    foreach ($line in @($deployOut | Where-Object { $_ -is [string] })) {
+        if ($line -match '^-\s+(?<id>\S+)\s+@(?<ver>\S+)(?:\s+-\s*(?<desc>.*))?\s*$') {
+            $newDep = [pscustomobject]@{
+                Id          = $matches['id']
+                Version     = $matches['ver']
+                Description = if ($matches['desc']) { $matches['desc'].Trim() } else { '' }
+                Url         = "https://script.google.com/macros/s/$($matches['id'])/exec"
+            }
+            break
+        }
+    }
+
+    if (-not $newDep) {
+        Write-Warning "clasp deploy succeeded but no deployment line was found in its output."
+    }
+    return $newDep
+}
+
+try {
+    # Decide the action up front. Supplying -Description on the command line
+    # skips the picker and runs the deploy action directly.
+    if ($Description) {
+        $mode = 'Deploy'
+    } else {
+        $mode = Show-MainMenu
+        if (-not $mode) {
             Write-Host "Cancelled. No changes made." -ForegroundColor Yellow
             exit 2
         }
     }
 
-    Write-Host ''
-    Write-Host ("Selected : {0}" -f $choice.Id) -ForegroundColor Green
-    Write-Host ("Version  : {0}" -f $choice.Version) -ForegroundColor Green
-    Write-Host ("Desc     : {0}" -f $choice.Description) -ForegroundColor Green
-    Write-Host ("URL      : {0}" -f $choice.Url) -ForegroundColor Green
-    Write-Host ''
+    switch ($mode) {
+        'Update' {
+            $items = Get-Deployments -Path $BackendPath
+            if (-not $items -or $items.Count -eq 0) {
+                Write-Host "No deployments available for $BackendPath." -ForegroundColor Yellow
+                exit 1
+            }
 
-    Set-ApiUrlInFile -File $FrontendFile -Url $choice.Url
-    Write-Host "Updated API_URL in $FrontendFile" -ForegroundColor Green
+            if ($items.Count -eq 1) {
+                $choice = $items[0]
+                Write-Host ("Only one deployment found, using {0} ({1})." -f $choice.Version, $choice.Id) -ForegroundColor Yellow
+            } else {
+                $choice = Show-Picker -Items $items -Title "Apps Script deployments ($BackendPath)"
+                if (-not $choice) {
+                    Write-Host "Cancelled. No changes made." -ForegroundColor Yellow
+                    exit 2
+                }
+            }
 
-    Write-ReleaseInfo -File $ReleaseInfoFile -Deployment $choice
-    Write-Host "Wrote release info to $ReleaseInfoFile" -ForegroundColor Green
+            Write-Host ''
+            Write-Host ("Selected : {0}" -f $choice.Id) -ForegroundColor Green
+            Write-Host ("Version  : {0}" -f $choice.Version) -ForegroundColor Green
+            Write-Host ("Desc     : {0}" -f $choice.Description) -ForegroundColor Green
+            Write-Host ("URL      : {0}" -f $choice.Url) -ForegroundColor Green
+            Write-Host ''
+
+            Set-ApiUrlInFile -File $FrontendFile -Url $choice.Url
+            Write-Host "Updated API_URL in $FrontendFile" -ForegroundColor Green
+
+            Write-ReleaseInfo -File $ReleaseInfoFile -Deployment $choice
+            Write-Host "Wrote release info to $ReleaseInfoFile" -ForegroundColor Green
+        }
+        'Deploy' {
+            # Show the latest deployment before asking for a new description,
+            # so the user knows what is currently out there. @HEAD is
+            # skipped and the highest versionNumber wins, via clasp's JSON
+            # output (more reliable than the text format).
+            try {
+                $latest = Get-LatestDeployment -Path $BackendPath
+                Write-Host ''
+                if ($latest) {
+                    Write-Host 'Current latest deployment:' -ForegroundColor Cyan
+                    Write-Host ("  Id          : {0}" -f $latest.DeploymentId)
+                    Write-Host ("  Version     : {0}" -f $latest.VersionNumber)
+                    Write-Host ("  Description : {0}" -f $latest.Description)
+                } else {
+                    Write-Host 'No existing deployments yet (this will be the first).' -ForegroundColor Yellow
+                }
+                Write-Host ''
+            }
+            catch {
+                # Don't block the deploy just because listing failed; the
+                # push/deploy calls below will surface a clearer error if
+                # something is actually wrong with the backend setup.
+                Write-Warning ("Could not list current deployments: {0}" -f $_.Exception.Message)
+            }
+
+            # When we got here through the menu, $Description is unset; ask
+            # for it interactively. When -Description was passed on the
+            # command line it has already been validated non-empty.
+            if ([string]::IsNullOrWhiteSpace($Description)) {
+                $Description = Read-Host 'Enter a description for the new deployment'
+                if ([string]::IsNullOrWhiteSpace($Description)) {
+                    throw 'Description cannot be empty.'
+                }
+            }
+
+            $newDep = Invoke-PushDeployment -Path $BackendPath -Description $Description
+            if ($newDep) {
+                Write-Host ''
+                Write-Host ("New deployment : {0}" -f $newDep.Id) -ForegroundColor Green
+                Write-Host ("Version        : {0}" -f $newDep.Version) -ForegroundColor Green
+                Write-Host ("Description    : {0}" -f $newDep.Description) -ForegroundColor Green
+                Write-Host ("URL            : {0}" -f $newDep.Url) -ForegroundColor Green
+                Write-Host ''
+
+                Write-ReleaseInfo -File $ReleaseInfoFile -Deployment $newDep
+                Write-Host "Wrote release info to $ReleaseInfoFile" -ForegroundColor Green
+            }
+        }
+    }
 }
 catch {
     Write-Host ("Error: " + $_.Exception.Message) -ForegroundColor Red
