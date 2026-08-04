@@ -22,6 +22,13 @@
     Path to the HTML file holding the API_URL constant.
     Defaults to "../frontend/Index.html" relative to this script.
 
+.PARAMETER ReleaseInfoFile
+    Path to the release-info file that will record the deployment id and
+    description used to update the frontend. Defaults to "release_info.txt"
+    in the containing folder of this script (i.e. the parent of the tools/
+    folder). The file is always (re)generated and any existing file at the
+    target path is overwritten.
+
 .PARAMETER WhatIf
     If set, performs a dry-run: lists deployments, lets you pick, and
     prints the resulting URL but never modifies any file.
@@ -34,7 +41,8 @@
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [string] $BackendPath = (Join-Path $PSScriptRoot '..' 'backend'),
-    [string] $FrontendFile = (Join-Path $PSScriptRoot '..' 'frontend' 'Index.html')
+    [string] $FrontendFile = (Join-Path $PSScriptRoot '..' 'frontend' 'Index.html'),
+    [string] $ReleaseInfoFile = (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'release_info.txt')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -185,6 +193,51 @@ function Set-ApiUrlInFile {
     }
 }
 
+function Write-ReleaseInfo {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)] [string] $File,
+        [Parameter(Mandatory)] $Deployment
+    )
+
+    $content = @"
+# Released deployment
+DeploymentId : $($Deployment.Id)
+Version      : $($Deployment.Version)
+Description  : $($Deployment.Description)
+Url          : $($Deployment.Url)
+"@
+
+    if (-not $PSCmdlet.ShouldProcess($File, "Write release info")) {
+        return
+    }
+
+    # Resolve the target to an absolute path anchored at the containing
+    # folder of the tools/ directory when the caller did not override it.
+    $resolvedFile = if ([System.IO.Path]::IsPathRooted($File)) {
+        $File
+    } else {
+        Join-Path (Split-Path -Path $PSScriptRoot -Parent) $File
+    }
+
+    # Ensure the parent directory exists. The containing folder of tools/
+    # normally already exists, but creating it is cheap and avoids races
+    # when the script is run from a fresh clone.
+    $dir = Split-Path -LiteralPath $resolvedFile -Parent
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -LiteralPath $dir -Force | Out-Null
+    }
+
+    # [System.IO.File]::WriteAllText creates the file when it does not exist
+    # and overwrites it when it does. We want unconditional regeneration:
+    # any prior release_info.txt in the containing folder of tools is
+    # replaced with the freshly selected deployment. Failures here are
+    # surfaced to the caller (no try/catch) so the script does not silently
+    # report success while leaving stale info behind.
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($resolvedFile, $content, $utf8NoBom)
+}
+
 try {
     $items = Get-Deployments -Path $BackendPath
     if (-not $items -or $items.Count -eq 0) {
@@ -212,6 +265,9 @@ try {
 
     Set-ApiUrlInFile -File $FrontendFile -Url $choice.Url
     Write-Host "Updated API_URL in $FrontendFile" -ForegroundColor Green
+
+    Write-ReleaseInfo -File $ReleaseInfoFile -Deployment $choice
+    Write-Host "Wrote release info to $ReleaseInfoFile" -ForegroundColor Green
 }
 catch {
     Write-Host ("Error: " + $_.Exception.Message) -ForegroundColor Red
