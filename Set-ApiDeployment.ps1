@@ -20,6 +20,11 @@
          `clasp deploy -d <description>`, then shows the resulting
          deployment (id and description) and writes it to release_info.txt.
 
+      3. Start a local HTTP server in the frontend folder: picks a free
+         port (8000-8099) and launches `python -m http.server` (or
+         `npx http-server` as a fallback) in a new window so Index.html
+         can be previewed in a browser.
+
     When -Description is supplied on the command line the picker is
     skipped and the deploy action runs directly.
 
@@ -330,10 +335,11 @@ function Show-Picker {
 
 function Show-MainMenu {
     # Top-level action picker. Returns the chosen action key
-    # ('Update' or 'Deploy') or $null if the user cancels.
+    # ('Update', 'Deploy' or 'Localhost') or $null if the user cancels.
     $options = @(
-        [pscustomobject]@{ Key = 'Update'; Label = 'Update API_URL in Index.html' }
-        [pscustomobject]@{ Key = 'Deploy'; Label = 'Deploy a new Apps Script version' }
+        [pscustomobject]@{ Key = 'Update';    Label = 'Update API_URL in Index.html' }
+        [pscustomobject]@{ Key = 'Deploy';    Label = 'Deploy a new Apps Script version' }
+        [pscustomobject]@{ Key = 'Localhost'; Label = 'Start a local HTTP server in the frontend folder' }
     )
 
     $sel = 0
@@ -416,6 +422,82 @@ function Set-ApiUrlInFile {
         # Write back as UTF-8 without BOM to preserve the file's existing encoding.
         $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
         [System.IO.File]::WriteAllText((Resolve-Path -LiteralPath $File).Path, $newContent, $utf8NoBom)
+    }
+}
+
+function Start-LocalhostServer {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $FrontendPath)
+
+    if (-not (Test-Path -LiteralPath $FrontendPath)) {
+        throw "Frontend folder not found: $FrontendPath"
+    }
+
+    # Find a free port, starting at 8000 and walking up to 8099.
+    $port = $null
+    for ($p = 8000; $p -lt 8100; $p++) {
+        $listener = $null
+        try {
+            $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $p)
+            $listener.Start()
+            $port = $p
+            break
+        }
+        catch {
+            continue
+        }
+        finally {
+            if ($listener) {
+                try { $listener.Stop() } catch { }
+            }
+        }
+    }
+    if (-not $port) {
+        throw "Could not find an available port in the range 8000-8099."
+    }
+
+    # Prefer Python 3's built-in http.server; fall back to npx http-server.
+    $serverCmd = $null
+    $serverArgs = @()
+    if (Get-Command python -ErrorAction SilentlyContinue) {
+        $serverCmd = 'python'
+        $serverArgs = @('-m', 'http.server', $port)
+    }
+    elseif (Get-Command python3 -ErrorAction SilentlyContinue) {
+        $serverCmd = 'python3'
+        $serverArgs = @('-m', 'http.server', $port)
+    }
+    elseif (Get-Command npx -ErrorAction SilentlyContinue) {
+        $serverCmd = 'npx'
+        $serverArgs = @('http-server', '.', '-p', "$port", '-c-1')
+    }
+
+    if (-not $serverCmd) {
+        throw "No HTTP server tool found. Install Python 3 (or Node.js for npx http-server)."
+    }
+
+    Write-Host ''
+    Write-Host ("Frontend folder : {0}" -f $FrontendPath)
+    Write-Host ("URL            : http://localhost:{0}/" -f $port)
+    Write-Host ("Command        : {0} {1}" -f $serverCmd, ($serverArgs -join ' '))
+    Write-Host ''
+
+    if ($WhatIfPreference) {
+        Write-Host "[WhatIf] Would launch the server in a new window. Stop it with Ctrl+C in that window." -ForegroundColor DarkGray
+        return
+    }
+
+    # Launch in a new console window so the user can see server logs and
+    # stop the server with Ctrl+C without blocking this script.
+    Start-Process -FilePath $serverCmd -ArgumentList $serverArgs -WorkingDirectory $FrontendPath
+
+    # Give the server a moment to bind, then open the default browser.
+    Start-Sleep -Milliseconds 750
+    try {
+        Start-Process -FilePath ("http://localhost:{0}/" -f $port) -ErrorAction SilentlyContinue
+    }
+    catch {
+        # Browser open is best-effort; ignore failures (e.g. headless env).
     }
 }
 
@@ -631,6 +713,10 @@ try {
                 Write-ReleaseInfo -File $ReleaseInfoFile -Deployment $newDep
                 Write-Host "Wrote release info to $ReleaseInfoFile" -ForegroundColor Green
             }
+        }
+        'Localhost' {
+            $frontendFolder = Split-Path -Path $FrontendFile -Parent
+            Start-LocalhostServer -FrontendPath $frontendFolder
         }
     }
 }
