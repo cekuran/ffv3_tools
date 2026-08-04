@@ -96,6 +96,25 @@ function Get-Deployments {
         throw "clasp CLI is not installed or not on PATH. Install with: npm i -g @google/clasp"
     }
 
+    try {
+        $jsonItems = @(Get-DeploymentsJson -Path $Path)
+        if ($jsonItems.Count -gt 0) {
+            return @(
+                $jsonItems | ForEach-Object {
+                    [pscustomobject]@{
+                        Id          = [string] $_.DeploymentId
+                        Version     = if ($null -eq $_.VersionNumber) { '' } else { [string] $_.VersionNumber }
+                        Description = if ($null -eq $_.Description) { '' } else { [string] $_.Description }
+                        Url         = "https://script.google.com/macros/s/$([string] $_.DeploymentId)/exec"
+                    }
+                }
+            )
+        }
+    }
+    catch {
+        Write-Verbose ("JSON listing failed: {0}" -f $_.Exception.Message)
+    }
+
     Push-Location -LiteralPath $Path
     try {
         $raw = & clasp deployments 2>&1
@@ -111,13 +130,14 @@ function Get-Deployments {
     $lines = @($raw | Where-Object { $_ -is [string] })
     $items = New-Object System.Collections.Generic.List[object]
     foreach ($line in $lines) {
+        $cleanLine = [regex]::Replace([string]$line, '\x1B\[[0-9;]*[A-Za-z]', '')
         # Header line: "Found N deployments." -> skip
-        if ($line -match '^Found\s+\d+\s+deployment') { continue }
-        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($cleanLine -match '^Found\s+\d+\s+deployment') { continue }
+        if ([string]::IsNullOrWhiteSpace($cleanLine)) { continue }
         # Body lines look like: "- <DEPLOYMENT_ID> @<VERSION>[ - <DESCRIPTION>]"
         # Description is optional; @HEAD lines have no description. ID is the first token after "- ".
-        if ($line -notmatch '^-\s+(?<id>\S+)\s+@(?<ver>\S+)(?:\s+-\s*(?<desc>.*))?\s*$') {
-            Write-Warning "Skipping unrecognized line: $line"
+        if ($cleanLine -notmatch '^-\s+(?<id>\S+)\s+@(?<ver>\S+)(?:\s+-\s*(?<desc>.*))?\s*$') {
+            Write-Warning "Skipping unrecognized line: $cleanLine"
             continue
         }
         $items.Add([pscustomobject]@{
@@ -800,20 +820,39 @@ try {
 
     switch ($mode) {
         'Update' {
-            $items = Get-Deployments -Path $BackendPath
+            $items = @(Get-DeploymentsJson -Path $BackendPath | ForEach-Object {
+                [pscustomobject]@{
+                    Id          = [string] $_.DeploymentId
+                    Version     = if ($null -eq $_.VersionNumber) { '' } else { [string] $_.VersionNumber }
+                    Description = if ($null -eq $_.Description) { '' } else { [string] $_.Description }
+                    Url         = "https://script.google.com/macros/s/$([string] $_.DeploymentId)/exec"
+                }
+            })
+            if ($items.Count -eq 0) {
+                $items = Get-Deployments -Path $BackendPath
+            }
             if (-not $items -or $items.Count -eq 0) {
                 Write-Host "No deployments available for $BackendPath." -ForegroundColor Yellow
                 exit 1
             }
 
-            # Show newest deployments first in the picker.
-            $items = @($items | Sort-Object -Property @(
-                @{ Expression = {
-                        $v = [string] $_.Version
-                        if ($v -match '^\d+$') { [int] $v } else { -1 }
-                    }; Descending = $true },
-                @{ Expression = { [string] $_.Id }; Descending = $true }
-            ))
+            # Show newest deployments first in the picker. Use a compatibility
+            # path that avoids per-key hashtable sort metadata, which can throw
+            # "Argument types do not match" in some host/runtime combinations.
+            $items = @(
+                $items |
+                ForEach-Object {
+                    $verText = [string] $_.Version
+                    $verNum = if ($verText -match '^\d+$') { [int] $verText } else { -1 }
+                    [pscustomobject]@{
+                        SortVersion = $verNum
+                        SortId      = [string] $_.Id
+                        Item        = $_
+                    }
+                } |
+                Sort-Object -Property SortVersion, SortId -Descending |
+                ForEach-Object { $_.Item }
+            )
 
             if ($items.Count -eq 1) {
                 $choice = $items[0]
@@ -911,6 +950,13 @@ try {
     }
 }
 catch {
-    Write-Host ("Error: " + $_.Exception.Message) -ForegroundColor Red
+    $err = $_
+    Write-Host ("Error: " + $err.Exception.Message) -ForegroundColor Red
+    if ($err.InvocationInfo) {
+        Write-Host ("At line {0}: {1}" -f $err.InvocationInfo.ScriptLineNumber, $err.InvocationInfo.Line.Trim()) -ForegroundColor DarkGray
+    }
+    if ($err.ScriptStackTrace) {
+        Write-Host ("Stack: {0}" -f $err.ScriptStackTrace) -ForegroundColor DarkGray
+    }
     exit 1
 }
