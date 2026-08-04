@@ -296,32 +296,16 @@ function Show-Picker {
     }
 
     $sel = 0
-    $top = [Console]::CursorTop
-    $hostUi = $Host.UI.RawUI
-
-    # The picker renders 3 header lines plus one row per item plus one
-    # trailing cursor position. When the cursor is already near the
-    # bottom of a small console, SetCursorPosition calls would throw
-    # "must be less than the buffer size". Clamp $top so every row we
-    # touch stays inside the buffer.
-    $rowsNeeded = 3 + $Items.Count + 1
-    $maxTop = [Math]::Max(0, $hostUi.BufferHeight - $rowsNeeded)
-    $top = [Math]::Min($top, $maxTop)
 
     function Render {
-        param($Items, [int] $Sel, [int] $Top, [string] $Title)
-        # Move to the saved top line and redraw the menu from there.
-        [Console]::SetCursorPosition(0, $Top)
-        $width = [Math]::Max(20, $hostUi.BufferWidth - 1)
-        $clearLine = (' ' * $width)
-
+        param($Items, [int] $Sel, [string] $Title)
+        # Full-screen redraw is more robust across VS Code terminals than
+        # cursor repositioning with SetCursorPosition.
+        Clear-Host
         Write-Host ("{0}" -f $Title) -ForegroundColor Cyan
         Write-Host ("Use Up/Down to move, Enter to select, Esc to cancel, Home/End to jump.")
         Write-Host ''
         for ($i = 0; $i -lt $Items.Count; $i++) {
-            [Console]::SetCursorPosition(0, $Top + 3 + $i)
-            Write-Host $clearLine -NoNewline
-            [Console]::SetCursorPosition(0, $Top + 3 + $i)
             $prefix = if ($i -eq $Sel) { '> ' } else { '  ' }
             $id = $Items[$i].Id
             $ver = $Items[$i].Version
@@ -333,12 +317,11 @@ function Show-Picker {
                 Write-Host $row
             }
         }
-        # Reset colors so the next plain Write-Host doesn't inherit the highlight background.
+        # Reset colors so the next plain Write-Host doesn't inherit highlight background.
         [Console]::ResetColor()
-        [Console]::SetCursorPosition(0, $Top + 3 + $Items.Count)
     }
 
-    Render -Items $Items -Sel $sel -Top $top -Title $Title
+    Render -Items $Items -Sel $sel -Title $Title
     try {
         while ($true) {
             $key = [Console]::ReadKey($true)
@@ -351,18 +334,13 @@ function Show-Picker {
                 'Escape'     { return $null }
                 default      { continue }
             }
-            Render -Items $Items -Sel $sel -Top $top -Title $Title
+            Render -Items $Items -Sel $sel -Title $Title
         }
     }
     finally {
-        # Wipe the whole screen so no picker artifacts (cursor positions,
-        # leftover colored backgrounds, partial lines) survive into the rest
-        # of the script or the user's shell. Clear-Host is the canonical
-        # PowerShell way to do this and works on both Windows Terminal and
-        # the classic console host.
+        # Wipe the whole screen so no picker artifacts survive into the shell.
         [Console]::ResetColor()
         Clear-Host
-        [Console]::SetCursorPosition(0, 0)
     }
 }
 
@@ -377,28 +355,14 @@ function Show-MainMenu {
     )
 
     $sel = 0
-    $top = [Console]::CursorTop
-    $hostUi = $Host.UI.RawUI
-
-    # Same buffer-height clamp as Show-Picker: ensure every row we touch
-    # is inside the console buffer so SetCursorPosition does not throw.
-    $rowsNeeded = 3 + $options.Count + 1
-    $maxTop = [Math]::Max(0, $hostUi.BufferHeight - $rowsNeeded)
-    $top = [Math]::Min($top, $maxTop)
 
     function Render {
-        param($Opts, [int] $Sel, [int] $Top)
-        [Console]::SetCursorPosition(0, $Top)
-        $width = [Math]::Max(20, $hostUi.BufferWidth - 1)
-        $clearLine = ' ' * $width
-
+        param($Opts, [int] $Sel)
+        Clear-Host
         Write-Host 'Choose an action:' -ForegroundColor Cyan
         Write-Host 'Use Up/Down to move, Enter to select, Esc to cancel.'
         Write-Host ''
         for ($i = 0; $i -lt $Opts.Count; $i++) {
-            [Console]::SetCursorPosition(0, $Top + 3 + $i)
-            Write-Host $clearLine -NoNewline
-            [Console]::SetCursorPosition(0, $Top + 3 + $i)
             $prefix = if ($i -eq $Sel) { '> ' } else { '  ' }
             $row = "$prefix$($Opts[$i].Label)"
             if ($i -eq $Sel) {
@@ -408,10 +372,9 @@ function Show-MainMenu {
             }
         }
         [Console]::ResetColor()
-        [Console]::SetCursorPosition(0, $Top + 3 + $Opts.Count)
     }
 
-    Render -Opts $options -Sel $sel -Top $top
+    Render -Opts $options -Sel $sel
     try {
         while ($true) {
             $key = [Console]::ReadKey($true)
@@ -422,13 +385,12 @@ function Show-MainMenu {
                 'Escape'    { return $null }
                 default     { continue }
             }
-            Render -Opts $options -Sel $sel -Top $top
+            Render -Opts $options -Sel $sel
         }
     }
     finally {
         [Console]::ResetColor()
         Clear-Host
-        [Console]::SetCursorPosition(0, 0)
     }
 }
 
