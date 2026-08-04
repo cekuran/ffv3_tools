@@ -4,7 +4,7 @@
     Manages Google Apps Script deployments for the backend project.
 
 .DESCRIPTION
-    Two actions are available and chosen interactively from a keyboard
+    Four actions are available and chosen interactively from a keyboard
     picker (Up/Down to move, Enter to select, Esc to cancel):
 
       1. Update API_URL in frontend/Index.html: runs `clasp deployments`,
@@ -25,6 +25,10 @@
          `npx http-server` as a fallback) in a new window so Index.html
          can be previewed in a browser.
 
+      4. Deploy the frontend over Netlify: runs `netlify deploy --dir
+         <frontend> --no-build --prod` from the repo root, then writes
+         the Production URL and Unique deploy URL to release_info_netlify.txt.
+
     When -Description is supplied on the command line the picker is
     skipped and the deploy action runs directly.
 
@@ -43,6 +47,13 @@
     folder). The file is always (re)generated and any existing file at the
     target path is overwritten.
 
+.PARAMETER NetlifyReleaseInfoFile
+    Path to the release-info file that will record the Production URL and
+    Unique deploy URL produced by the Netlify deploy action. Defaults to
+    "release_info_netlify.txt" in the containing folder of this script
+    (i.e. the parent of the tools/ folder). The file is always
+    (re)generated and any existing file at the target path is overwritten.
+
 .PARAMETER Description
     Description for the new Apps Script deployment created by the deploy
     action. When provided the script skips the main menu and runs the
@@ -52,7 +63,8 @@
     If set, performs a dry-run. For the update action it lists
     deployments, lets you pick, and prints the resulting URL but never
     modifies any file. For the deploy action it prints the clasp
-    commands that would run without running them.
+    commands that would run without running them. For the Netlify action
+    it prints the netlify command that would run without running it.
 
 .EXAMPLE
     pwsh ./tools/Set-ApiDeployment.ps1
@@ -66,6 +78,7 @@ param(
     [string] $BackendPath = (Join-Path $PSScriptRoot '..' 'backend'),
     [string] $FrontendFile = (Join-Path $PSScriptRoot '..' 'frontend' 'Index.html'),
     [string] $ReleaseInfoFile = (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'release_info.txt'),
+    [string] $NetlifyReleaseInfoFile = (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'release_info_netlify.txt'),
     [ValidateNotNullOrEmpty()]
     [string] $Description
 )
@@ -335,11 +348,12 @@ function Show-Picker {
 
 function Show-MainMenu {
     # Top-level action picker. Returns the chosen action key
-    # ('Update', 'Deploy' or 'Localhost') or $null if the user cancels.
+    # ('Update', 'Deploy', 'Localhost' or 'Netlify') or $null if the user cancels.
     $options = @(
         [pscustomobject]@{ Key = 'Update';    Label = 'Update API_URL in Index.html' }
         [pscustomobject]@{ Key = 'Deploy';    Label = 'Deploy a new Apps Script version' }
         [pscustomobject]@{ Key = 'Localhost'; Label = 'Start a local HTTP server in the frontend folder' }
+        [pscustomobject]@{ Key = 'Netlify';   Label = 'Deploy the frontend over Netlify' }
     )
 
     $sel = 0
@@ -546,6 +560,42 @@ Url          : $($Deployment.Url)
     [System.IO.File]::WriteAllText($resolvedFile, $content, $utf8NoBom)
 }
 
+function Write-NetlifyReleaseInfo {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)] [string] $File,
+        [Parameter(Mandatory)] $Deployment
+    )
+
+    $content = @"
+# Netlify deployment
+ProductionUrl : $($Deployment.ProductionUrl)
+UniqueUrl     : $($Deployment.UniqueUrl)
+"@
+
+    if (-not $PSCmdlet.ShouldProcess($File, "Write Netlify release info")) {
+        return
+    }
+
+    # Resolve a relative path against the containing folder of the tools/
+    # directory so the file lands next to release_info.txt in the repo root.
+    $resolvedFile = if ([System.IO.Path]::IsPathRooted($File)) {
+        $File
+    } else {
+        Join-Path (Split-Path -Path $PSScriptRoot -Parent) $File
+    }
+
+    $dir = Split-Path -Path $resolvedFile -Parent
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -LiteralPath $dir -Force | Out-Null
+    }
+
+    # Always overwrite. Failures propagate so the script does not silently
+    # report success while leaving stale info behind.
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($resolvedFile, $content, $utf8NoBom)
+}
+
 function Invoke-PushDeployment {
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
@@ -619,6 +669,72 @@ function Invoke-PushDeployment {
         Write-Warning "clasp deploy succeeded but no deployment line was found in its output."
     }
     return $newDep
+}
+
+function Invoke-NetlifyDeploy {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)] [string] $Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Frontend folder not found: $Path"
+    }
+    if (-not (Get-Command netlify -ErrorAction SilentlyContinue)) {
+        throw "netlify CLI is not installed or not on PATH. Install with: npm i -g netlify-cli"
+    }
+
+    # Run from the repo root so Netlify picks up netlify.toml / .netlify/state.json
+    # if they exist. The --dir argument gets the absolute frontend path so it
+    # resolves correctly regardless of the caller's working directory.
+    $absFrontend = (Resolve-Path -LiteralPath $Path).Path
+    $repoRoot = Split-Path -Path $PSScriptRoot -Parent
+    $cmd = @('deploy', '--dir', $absFrontend, '--no-build', '--prod')
+
+    if (-not $PSCmdlet.ShouldProcess("$repoRoot (netlify $($cmd -join ' '))", 'Netlify deploy')) {
+        Write-Host ("[WhatIf] Would run: netlify {0} in {1}" -f ($cmd -join ' '), $repoRoot) -ForegroundColor DarkGray
+        return $null
+    }
+
+    Push-Location -LiteralPath $repoRoot
+    try {
+        $raw = & netlify @cmd 2>&1
+        $exit = $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+    }
+    if ($exit -ne 0) {
+        throw "netlify deploy failed (exit $exit):`n$raw"
+    }
+
+    # Echo netlify's output so the user sees what happened.
+    foreach ($line in @($raw | Where-Object { $_ -is [string] })) {
+        Write-Host $line
+    }
+
+    # Parse the two URL lines netlify prints on success. Either may be missing
+    # in older versions or custom output formats, so neither is fatal.
+    $productionUrl = $null
+    $uniqueUrl = $null
+    foreach ($line in @($raw | Where-Object { $_ -is [string] })) {
+        if ($null -eq $productionUrl -and $line -match '^Production URL:\s+(?<url>\S+)') {
+            $productionUrl = $matches['url']
+        }
+        elseif ($null -eq $uniqueUrl -and $line -match '^Unique deploy URL:\s+(?<url>\S+)') {
+            $uniqueUrl = $matches['url']
+        }
+    }
+
+    if (-not $productionUrl -and -not $uniqueUrl) {
+        Write-Warning "netlify deploy succeeded but no 'Production URL:' / 'Unique deploy URL:' line was found in its output."
+    }
+
+    return [pscustomobject]@{
+        ProductionUrl = $productionUrl
+        UniqueUrl     = $uniqueUrl
+        Raw           = ($raw -join "`n")
+    }
 }
 
 try {
@@ -717,6 +833,23 @@ try {
         'Localhost' {
             $frontendFolder = Split-Path -Path $FrontendFile -Parent
             Start-LocalhostServer -FrontendPath $frontendFolder
+        }
+        'Netlify' {
+            $frontendFolder = Split-Path -Path $FrontendFile -Parent
+            $result = Invoke-NetlifyDeploy -Path $frontendFolder
+            if ($result) {
+                Write-Host ''
+                if ($result.ProductionUrl) {
+                    Write-Host ("Production URL : {0}" -f $result.ProductionUrl) -ForegroundColor Green
+                }
+                if ($result.UniqueUrl) {
+                    Write-Host ("Unique URL     : {0}" -f $result.UniqueUrl) -ForegroundColor Green
+                }
+                Write-Host ''
+
+                Write-NetlifyReleaseInfo -File $NetlifyReleaseInfoFile -Deployment $result
+                Write-Host "Wrote Netlify release info to $NetlifyReleaseInfoFile" -ForegroundColor Green
+            }
         }
     }
 }
