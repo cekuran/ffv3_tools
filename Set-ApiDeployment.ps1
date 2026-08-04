@@ -127,7 +127,7 @@ function Get-Deployments {
             Url         = "https://script.google.com/macros/s/$($matches['id'])/exec"
         })
     }
-    return ,$items
+    return @($items)
 }
 
 function Get-DeploymentsJson {
@@ -201,7 +201,7 @@ function Get-DeploymentsJson {
             Url           = "https://script.google.com/macros/s/$id/exec"
         }
     }
-    return ,@($items)
+    return @($items)
 }
 
 function Get-LatestDeployment {
@@ -646,27 +646,75 @@ function Invoke-PushDeployment {
         throw "clasp deploy failed (exit $deployExit):`n$deployOut"
     }
 
-    # Echo clasp's own output so the user sees what happened, then parse the
-    # new deployment id from the trailing "- <id> @<ver> - <desc>" line.
+    # Parse only deployment rows and keep the newest one. Output formats vary:
+    #   - "- <id> @<ver> - <desc>"
+    #   - "Deployed <id> @<ver>"
+    $parsedDeps = New-Object System.Collections.Generic.List[object]
     foreach ($line in @($deployOut | Where-Object { $_ -is [string] })) {
-        Write-Host $line
-    }
-
-    $newDep = $null
-    foreach ($line in @($deployOut | Where-Object { $_ -is [string] })) {
-        if ($line -match '^-\s+(?<id>\S+)\s+@(?<ver>\S+)(?:\s+-\s*(?<desc>.*))?\s*$') {
-            $newDep = [pscustomobject]@{
-                Id          = $matches['id']
-                Version     = $matches['ver']
-                Description = if ($matches['desc']) { $matches['desc'].Trim() } else { '' }
-                Url         = "https://script.google.com/macros/s/$($matches['id'])/exec"
+        $cleanLine = [regex]::Replace([string]$line, '\x1B\[[0-9;]*[A-Za-z]', '')
+        if (
+            ($cleanLine -match '^-\s+(?<id>\S+)\s+@(?<ver>\S+)(?:\s+-\s*(?<desc>.*))?\s*$') -or
+            ($cleanLine -match '^Deployed\s+(?<id>\S+)\s+@(?<ver>\S+)\s*$')
+        ) {
+            $verText = $matches['ver']
+            $verNum = if ($verText -match '^\d+$') { [int]$verText } else { $null }
+            $descText = if ($matches['desc']) { $matches['desc'].Trim() } else { '' }
+            if ([string]::IsNullOrWhiteSpace($descText)) {
+                $descText = $Description
             }
-            break
+            $parsedDeps.Add([pscustomobject]@{
+                Id          = $matches['id']
+                Version     = $verText
+                VersionNum  = $verNum
+                Description = $descText
+                Url         = "https://script.google.com/macros/s/$($matches['id'])/exec"
+            })
         }
     }
 
+    $newDep = $null
+    if ($parsedDeps.Count -gt 0) {
+        $withVersion = @($parsedDeps | Where-Object { $null -ne $_.VersionNum })
+        if ($withVersion.Count -gt 0) {
+            $newDep = @($withVersion | Sort-Object -Property VersionNum -Descending)[0]
+        } else {
+            # Fallback when only non-numeric versions exist (for example @HEAD).
+            $newDep = @($parsedDeps)[-1]
+        }
+
+        # Some clasp output variants can miss the id token while still
+        # reporting the version. Backfill from the actual latest deployment.
+        if ([string]::IsNullOrWhiteSpace([string]$newDep.Id)) {
+            $latest = Get-LatestDeployment -Path $Path
+            if ($latest -and -not [string]::IsNullOrWhiteSpace([string]$latest.DeploymentId)) {
+                $newDep.Id = [string] $latest.DeploymentId
+                if ($null -eq $newDep.VersionNum -and $null -ne $latest.VersionNumber) {
+                    $newDep.Version = [string] $latest.VersionNumber
+                    $newDep.VersionNum = [int] $latest.VersionNumber
+                }
+                $newDep.Url = "https://script.google.com/macros/s/$($newDep.Id)/exec"
+            }
+        }
+
+        Write-Host ("Created deployment: {0} @{1}" -f $newDep.Id, $newDep.Version) -ForegroundColor Green
+    }
+
     if (-not $newDep) {
-        Write-Warning "clasp deploy succeeded but no deployment line was found in its output."
+        # Last-resort fallback: ask clasp for the latest deployment after a
+        # successful deploy, then map it to the shape expected by callers.
+        $latest = Get-LatestDeployment -Path $Path
+        if ($latest) {
+            $newDep = [pscustomobject]@{
+                Id          = [string] $latest.DeploymentId
+                Version     = if ($null -eq $latest.VersionNumber) { '@HEAD' } else { [string] $latest.VersionNumber }
+                VersionNum  = if ($null -eq $latest.VersionNumber) { $null } else { [int] $latest.VersionNumber }
+                Description = if ([string]::IsNullOrWhiteSpace([string] $latest.Description)) { $Description } else { [string] $latest.Description }
+                Url         = "https://script.google.com/macros/s/$($latest.DeploymentId)/exec"
+            }
+            Write-Host ("Created deployment: {0} @{1}" -f $newDep.Id, $newDep.Version) -ForegroundColor Green
+        } else {
+            Write-Warning "clasp deploy succeeded but no deployment line was found in its output."
+        }
     }
     return $newDep
 }
@@ -757,6 +805,15 @@ try {
                 Write-Host "No deployments available for $BackendPath." -ForegroundColor Yellow
                 exit 1
             }
+
+            # Show newest deployments first in the picker.
+            $items = @($items | Sort-Object -Property @(
+                @{ Expression = {
+                        $v = [string] $_.Version
+                        if ($v -match '^\d+$') { [int] $v } else { -1 }
+                    }; Descending = $true },
+                @{ Expression = { [string] $_.Id }; Descending = $true }
+            ))
 
             if ($items.Count -eq 1) {
                 $choice = $items[0]
