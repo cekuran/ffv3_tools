@@ -4,8 +4,10 @@
     Manages Google Apps Script deployments for the backend project.
 
 .DESCRIPTION
-    Four actions are available and chosen interactively from a keyboard
-    picker (Up/Down to move, Enter to select, Esc to cancel):
+    Six actions are available and chosen interactively from a keyboard
+    picker (Up/Down to move, Enter to select, Esc to cancel). After every
+    action except Exit, the script pauses and shows the menu again so you
+    can chain multiple actions in a single run:
 
       1. Update API_URL in frontend/Index.html: runs `clasp deployments`,
          parses each line into DeploymentId / Version / Description and
@@ -20,17 +22,26 @@
          `clasp deploy -d <description>`, then shows the resulting
          deployment (id and description) and writes it to release_info.txt.
 
-      3. Start a local HTTP server in the frontend folder: picks a free
+      3. Undeploy an Apps Script deployment: lists current deployments,
+         shows an interactive picker, and runs `clasp undeploy <id>` after
+         a typed confirmation. The frontend API_URL may still point to the
+         removed deployment afterwards and will need to be updated with
+         action 1.
+
+      4. Start a local HTTP server in the frontend folder: picks a free
          port (8000-8099) and launches `python -m http.server` (or
          `npx http-server` as a fallback) in a new window so Index.html
          can be previewed in a browser.
 
-      4. Deploy the frontend over Netlify: runs `netlify deploy --dir
+      5. Deploy the frontend over Netlify: runs `netlify deploy --dir
          <frontend> --no-build --prod` from the repo root, then writes
          the Production URL and Unique deploy URL to release_info_netlify.txt.
 
-    When -Description is supplied on the command line the picker is
-    skipped and the deploy action runs directly.
+      6. Exit the script.
+
+    When -Description, -UndeployId, or -UndeployAll is supplied on the
+    command line the picker is skipped and the matching action runs
+    directly without confirmation.
 
 .PARAMETER BackendPath
     Path to the clasp project folder (must contain .clasp.json).
@@ -59,11 +70,25 @@
     action. When provided the script skips the main menu and runs the
     deploy action directly.
 
+.PARAMETER UndeployId
+    Deployment ID to undeploy. When provided (and -UndeployAll is not)
+    the script skips the main menu and runs the undeploy action directly
+    without the typed confirmation prompt. Cannot be combined with
+    -UndeployAll.
+
+.PARAMETER UndeployAll
+    When set, undeploys every Apps Script deployment. When provided (and
+    -UndeployId is not) the script skips the main menu and runs the
+    undeploy action directly without the typed confirmation prompt.
+    Cannot be combined with -UndeployId.
+
 .PARAMETER WhatIf
     If set, performs a dry-run. For the update action it lists
     deployments, lets you pick, and prints the resulting URL but never
     modifies any file. For the deploy action it prints the clasp
-    commands that would run without running them. For the Netlify action
+    commands that would run without running them. For the undeploy action
+    it lists deployments, lets you pick, and prints the clasp undeploy
+    command that would run without running it. For the Netlify action
     it prints the netlify command that would run without running it.
 
 .EXAMPLE
@@ -72,6 +97,10 @@
     pwsh ./tools/Set-ApiDeployment.ps1 -WhatIf
 .EXAMPLE
     pwsh ./tools/Set-ApiDeployment.ps1 -Description 'Add CSV export'
+.EXAMPLE
+    pwsh ./tools/Set-ApiDeployment.ps1 -UndeployId 'AKfycbx...'
+.EXAMPLE
+    pwsh ./tools/Set-ApiDeployment.ps1 -UndeployAll
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
@@ -80,7 +109,10 @@ param(
     [string] $ReleaseInfoFile = (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'release_info.txt'),
     [string] $NetlifyReleaseInfoFile = (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'release_info_netlify.txt'),
     [ValidateNotNullOrEmpty()]
-    [string] $Description
+    [string] $Description,
+    [ValidateNotNullOrEmpty()]
+    [string] $UndeployId,
+    [switch] $UndeployAll
 )
 
 $ErrorActionPreference = 'Stop'
@@ -346,25 +378,40 @@ function Show-Picker {
 
 function Show-MainMenu {
     # Top-level action picker. Returns the chosen action key
-    # ('Update', 'Deploy', 'Localhost' or 'Netlify') or $null if the user cancels.
+    # ('Update', 'Deploy', 'Undeploy', 'Localhost', 'Netlify' or 'Exit') or $null if the user cancels.
     $options = @(
         [pscustomobject]@{ Key = 'Update';    Label = 'Update API_URL in Index.html' }
         [pscustomobject]@{ Key = 'Deploy';    Label = 'Deploy a new Apps Script version' }
+        [pscustomobject]@{ Key = 'Undeploy';  Label = 'Undeploy an Apps Script deployment' }
         [pscustomobject]@{ Key = 'Localhost'; Label = 'Start a local HTTP server in the frontend folder' }
         [pscustomobject]@{ Key = 'Netlify';   Label = 'Deploy the frontend over Netlify' }
+        [pscustomobject]@{ Key = 'Exit';      Label = 'Exit the script' }
+    )
+    $choice = Show-ListPicker -Options $options -Title 'Choose an action:'
+    if ($choice) { $choice.Key } else { $null }
+}
+
+function Show-ListPicker {
+    # Arrow-key picker over a labeled list. Used by Show-MainMenu and any
+    # action case that needs a sub-menu. Returns the chosen option object
+    # or $null if the user cancels.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] $Options,
+        [string] $Title = 'Select an option'
     )
 
     $sel = 0
 
     function Render {
-        param($Opts, [int] $Sel)
+        param($Options, [int] $Sel, [string] $Title)
         Clear-Host
-        Write-Host 'Choose an action:' -ForegroundColor Cyan
+        Write-Host ("{0}" -f $Title) -ForegroundColor Cyan
         Write-Host 'Use Up/Down to move, Enter to select, Esc to cancel.'
         Write-Host ''
-        for ($i = 0; $i -lt $Opts.Count; $i++) {
+        for ($i = 0; $i -lt $Options.Count; $i++) {
             $prefix = if ($i -eq $Sel) { '> ' } else { '  ' }
-            $row = "$prefix$($Opts[$i].Label)"
+            $row = "$prefix$($Options[$i].Label)"
             if ($i -eq $Sel) {
                 Write-Host $row -ForegroundColor Black -BackgroundColor Cyan
             } else {
@@ -374,18 +421,18 @@ function Show-MainMenu {
         [Console]::ResetColor()
     }
 
-    Render -Opts $options -Sel $sel
+    Render -Options $Options -Sel $sel -Title $Title
     try {
         while ($true) {
             $key = [Console]::ReadKey($true)
             switch ($key.Key) {
-                'UpArrow'   { $sel = ($sel - 1 + $options.Count) % $options.Count }
-                'DownArrow' { $sel = ($sel + 1) % $options.Count }
-                'Enter'     { return $options[$sel].Key }
+                'UpArrow'   { $sel = ($sel - 1 + $Options.Count) % $Options.Count }
+                'DownArrow' { $sel = ($sel + 1) % $Options.Count }
+                'Enter'     { return $Options[$sel] }
                 'Escape'    { return $null }
                 default     { continue }
             }
-            Render -Opts $options -Sel $sel
+            Render -Options $Options -Sel $sel -Title $Title
         }
     }
     finally {
@@ -540,6 +587,39 @@ Url          : $($Deployment.Url)
     # report success while leaving stale info behind.
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($resolvedFile, $content, $utf8NoBom)
+}
+
+function Clear-ReleaseInfo {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)] [string] $File,
+        [string] $DeploymentId
+    )
+
+    # Resolve relative paths against the parent of tools/ (where
+    # release_info.txt lives), matching the write-side helpers.
+    $resolvedFile = if ([System.IO.Path]::IsPathRooted($File)) {
+        $File
+    } else {
+        Join-Path (Split-Path -Path $PSScriptRoot -Parent) $File
+    }
+    if (-not (Test-Path -LiteralPath $resolvedFile)) {
+        return
+    }
+
+    # If a DeploymentId is given, only delete when the file references
+    # that specific deployment. Without it (e.g. -UndeployAll) the file
+    # is unconditionally stale and removed.
+    if ($DeploymentId) {
+        $content = Get-Content -LiteralPath $resolvedFile -Raw -ErrorAction SilentlyContinue
+        if ([string]::IsNullOrEmpty($content)) { return }
+        if ($content -notmatch '(?m)^DeploymentId\s*:\s*(?<id>\S+)\s*$') { return }
+        if ($matches['id'] -ne $DeploymentId) { return }
+    }
+
+    if ($PSCmdlet.ShouldProcess($resolvedFile, 'Remove stale release info')) {
+        Remove-Item -LiteralPath $resolvedFile -Force
+    }
 }
 
 function Write-NetlifyReleaseInfo {
@@ -701,6 +781,52 @@ function Invoke-PushDeployment {
     return $newDep
 }
 
+function Invoke-Undeploy {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [string] $DeploymentId,
+        [switch] $All
+    )
+
+    if ($All -and $DeploymentId) {
+        throw "Specify either -DeploymentId or -All, not both."
+    }
+    if (-not $All -and [string]::IsNullOrWhiteSpace($DeploymentId)) {
+        throw "Specify either -DeploymentId or -All."
+    }
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Backend path not found: $Path"
+    }
+    if (-not (Get-Command clasp -ErrorAction SilentlyContinue)) {
+        throw "clasp CLI is not installed or not on PATH. Install with: npm i -g @google/clasp"
+    }
+
+    $claspArgs = if ($All) { @('--all') } else { @($DeploymentId) }
+    $argDisplay = $claspArgs -join ' '
+
+    if (-not $PSCmdlet.ShouldProcess("$Path (clasp undeploy $argDisplay)", 'Undeploy deployment')) {
+        Write-Host ("[WhatIf] Would run: clasp undeploy $argDisplay in $Path") -ForegroundColor DarkGray
+        return
+    }
+
+    Push-Location -LiteralPath $Path
+    try {
+        $raw = & clasp undeploy @claspArgs 2>&1
+        $exit = $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+    }
+    if ($exit -ne 0) {
+        throw "clasp undeploy failed (exit $exit):`n$raw"
+    }
+    foreach ($line in @($raw | Where-Object { $_ -is [string] })) {
+        Write-Host $line
+    }
+}
+
 function Invoke-NetlifyDeploy {
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
@@ -768,147 +894,280 @@ function Invoke-NetlifyDeploy {
 }
 
 try {
-    # Decide the action up front. Supplying -Description on the command line
-    # skips the picker and runs the deploy action directly.
-    if ($Description) {
-        $mode = 'Deploy'
-    } else {
-        $mode = Show-MainMenu
-        if (-not $mode) {
-            Write-Host "Cancelled. No changes made." -ForegroundColor Yellow
-            exit 2
-        }
+    # Validate mutual exclusivity first.
+    if ($UndeployAll -and $UndeployId) {
+        throw "Cannot specify both -UndeployAll and -UndeployId."
     }
 
-    switch ($mode) {
-        'Update' {
-            $items = @(Get-DeploymentsJson -Path $BackendPath | ForEach-Object {
-                [pscustomobject]@{
-                    Id          = [string] $_.DeploymentId
-                    Version     = if ($null -eq $_.VersionNumber) { '' } else { [string] $_.VersionNumber }
-                    Description = if ($null -eq $_.Description) { '' } else { [string] $_.Description }
-                    Url         = "https://script.google.com/macros/s/$([string] $_.DeploymentId)/exec"
-                }
-            })
-            if ($items.Count -eq 0) {
-                $items = Get-Deployments -Path $BackendPath
+    # CLI params: single-shot mode (run once, exit). Without them the menu
+    # loops until the user picks Exit or presses Esc.
+    $singleShot = $UndeployId -or $UndeployAll -or $Description
+    $mode = $null
+    if ($UndeployId -or $UndeployAll) {
+        $mode = 'Undeploy'
+    } elseif ($Description) {
+        $mode = 'Deploy'
+    }
+
+    while ($true) {
+        if (-not $mode) {
+            $mode = Show-MainMenu
+            if (-not $mode) {
+                Write-Host "Cancelled. No changes made." -ForegroundColor Yellow
+                exit 2
             }
-            if (-not $items -or $items.Count -eq 0) {
-                Write-Host "No deployments available for $BackendPath." -ForegroundColor Yellow
-                exit 1
+            if ($mode -eq 'Exit') {
+                Write-Host 'Bye.' -ForegroundColor Cyan
+                exit 0
             }
-
-            # Show newest deployments first in the picker. Use a compatibility
-            # path that avoids per-key hashtable sort metadata, which can throw
-            # "Argument types do not match" in some host/runtime combinations.
-            $items = @(
-                $items |
-                ForEach-Object {
-                    $verText = [string] $_.Version
-                    $verNum = if ($verText -match '^\d+$') { [int] $verText } else { -1 }
-                    [pscustomobject]@{
-                        SortVersion = $verNum
-                        SortId      = [string] $_.Id
-                        Item        = $_
-                    }
-                } |
-                Sort-Object -Property SortVersion, SortId -Descending |
-                ForEach-Object { $_.Item }
-            )
-
-            if ($items.Count -eq 1) {
-                $choice = $items[0]
-                Write-Host ("Only one deployment found, using {0} ({1})." -f $choice.Version, $choice.Id) -ForegroundColor Yellow
-            } else {
-                $choice = Show-Picker -Items $items -Title "Apps Script deployments ($BackendPath)"
-                if (-not $choice) {
-                    Write-Host "Cancelled. No changes made." -ForegroundColor Yellow
-                    exit 2
-                }
-            }
-
-            Write-Host ''
-            Write-Host ("Selected : {0}" -f $choice.Id) -ForegroundColor Green
-            Write-Host ("Version  : {0}" -f $choice.Version) -ForegroundColor Green
-            Write-Host ("Desc     : {0}" -f $choice.Description) -ForegroundColor Green
-            Write-Host ("URL      : {0}" -f $choice.Url) -ForegroundColor Green
-            Write-Host ''
-
-            Set-ApiUrlInFile -File $FrontendFile -Url $choice.Url
-            Write-Host "Updated API_URL in $FrontendFile" -ForegroundColor Green
-
-            Write-ReleaseInfo -File $ReleaseInfoFile -Deployment $choice
-            Write-Host "Wrote release info to $ReleaseInfoFile" -ForegroundColor Green
         }
-        'Deploy' {
-            # Show the latest deployment before asking for a new description,
-            # so the user knows what is currently out there. @HEAD is
-            # skipped and the highest versionNumber wins, via clasp's JSON
-            # output (more reliable than the text format).
-            try {
-                $latest = Get-LatestDeployment -Path $BackendPath
-                Write-Host ''
-                if ($latest) {
-                    Write-Host 'Current latest deployment:' -ForegroundColor Cyan
-                    Write-Host ("  Id          : {0}" -f $latest.DeploymentId)
-                    Write-Host ("  Version     : {0}" -f $latest.VersionNumber)
-                    Write-Host ("  Description : {0}" -f $latest.Description)
+
+        switch ($mode) {
+            'Update' {
+                $items = @(Get-DeploymentsJson -Path $BackendPath | ForEach-Object {
+                    [pscustomobject]@{
+                        Id          = [string] $_.DeploymentId
+                        Version     = if ($null -eq $_.VersionNumber) { '' } else { [string] $_.VersionNumber }
+                        Description = if ($null -eq $_.Description) { '' } else { [string] $_.Description }
+                        Url         = "https://script.google.com/macros/s/$([string] $_.DeploymentId)/exec"
+                    }
+                })
+                if ($items.Count -eq 0) {
+                    $items = Get-Deployments -Path $BackendPath
+                }
+                if (-not $items -or $items.Count -eq 0) {
+                    Write-Host "No deployments available for $BackendPath." -ForegroundColor Yellow
+                    exit 1
+                }
+    
+                # Show newest deployments first in the picker. Use a compatibility
+                # path that avoids per-key hashtable sort metadata, which can throw
+                # "Argument types do not match" in some host/runtime combinations.
+                $items = @(
+                    $items |
+                    ForEach-Object {
+                        $verText = [string] $_.Version
+                        $verNum = if ($verText -match '^\d+$') { [int] $verText } else { -1 }
+                        [pscustomobject]@{
+                            SortVersion = $verNum
+                            SortId      = [string] $_.Id
+                            Item        = $_
+                        }
+                    } |
+                    Sort-Object -Property SortVersion, SortId -Descending |
+                    ForEach-Object { $_.Item }
+                )
+    
+                if ($items.Count -eq 1) {
+                    $choice = $items[0]
+                    Write-Host ("Only one deployment found, using {0} ({1})." -f $choice.Version, $choice.Id) -ForegroundColor Yellow
                 } else {
-                    Write-Host 'No existing deployments yet (this will be the first).' -ForegroundColor Yellow
+                    $choice = Show-Picker -Items $items -Title "Apps Script deployments ($BackendPath)"
+                    if (-not $choice) {
+                        Write-Host "Cancelled. No changes made." -ForegroundColor Yellow
+                        exit 2
+                    }
                 }
+    
                 Write-Host ''
-            }
-            catch {
-                # Don't block the deploy just because listing failed; the
-                # push/deploy calls below will surface a clearer error if
-                # something is actually wrong with the backend setup.
-                Write-Warning ("Could not list current deployments: {0}" -f $_.Exception.Message)
-            }
-
-            # When we got here through the menu, $Description is unset; ask
-            # for it interactively. When -Description was passed on the
-            # command line it has already been validated non-empty.
-            if ([string]::IsNullOrWhiteSpace($Description)) {
-                $Description = Read-Host 'Enter a description for the new deployment'
-                if ([string]::IsNullOrWhiteSpace($Description)) {
-                    throw 'Description cannot be empty.'
-                }
-            }
-
-            $newDep = Invoke-PushDeployment -Path $BackendPath -Description $Description
-            if ($newDep) {
+                Write-Host ("Selected : {0}" -f $choice.Id) -ForegroundColor Green
+                Write-Host ("Version  : {0}" -f $choice.Version) -ForegroundColor Green
+                Write-Host ("Desc     : {0}" -f $choice.Description) -ForegroundColor Green
+                Write-Host ("URL      : {0}" -f $choice.Url) -ForegroundColor Green
                 Write-Host ''
-                Write-Host ("New deployment : {0}" -f $newDep.Id) -ForegroundColor Green
-                Write-Host ("Version        : {0}" -f $newDep.Version) -ForegroundColor Green
-                Write-Host ("Description    : {0}" -f $newDep.Description) -ForegroundColor Green
-                Write-Host ("URL            : {0}" -f $newDep.Url) -ForegroundColor Green
-                Write-Host ''
-
-                Write-ReleaseInfo -File $ReleaseInfoFile -Deployment $newDep
+    
+                Set-ApiUrlInFile -File $FrontendFile -Url $choice.Url
+                Write-Host "Updated API_URL in $FrontendFile" -ForegroundColor Green
+    
+                Write-ReleaseInfo -File $ReleaseInfoFile -Deployment $choice
                 Write-Host "Wrote release info to $ReleaseInfoFile" -ForegroundColor Green
             }
-        }
-        'Localhost' {
-            $frontendFolder = Split-Path -Path $FrontendFile -Parent
-            Start-LocalhostServer -FrontendPath $frontendFolder
-        }
-        'Netlify' {
-            $frontendFolder = Split-Path -Path $FrontendFile -Parent
-            $result = Invoke-NetlifyDeploy -Path $frontendFolder
-            if ($result) {
-                Write-Host ''
-                if ($result.ProductionUrl) {
-                    Write-Host ("Production URL : {0}" -f $result.ProductionUrl) -ForegroundColor Green
+            'Deploy' {
+                # Show the latest deployment before asking for a new description,
+                # so the user knows what is currently out there. @HEAD is
+                # skipped and the highest versionNumber wins, via clasp's JSON
+                # output (more reliable than the text format).
+                try {
+                    $latest = Get-LatestDeployment -Path $BackendPath
+                    Write-Host ''
+                    if ($latest) {
+                        Write-Host 'Current latest deployment:' -ForegroundColor Cyan
+                        Write-Host ("  Id          : {0}" -f $latest.DeploymentId)
+                        Write-Host ("  Version     : {0}" -f $latest.VersionNumber)
+                        Write-Host ("  Description : {0}" -f $latest.Description)
+                    } else {
+                        Write-Host 'No existing deployments yet (this will be the first).' -ForegroundColor Yellow
+                    }
+                    Write-Host ''
                 }
-                if ($result.UniqueUrl) {
-                    Write-Host ("Unique URL     : {0}" -f $result.UniqueUrl) -ForegroundColor Green
+                catch {
+                    # Don't block the deploy just because listing failed; the
+                    # push/deploy calls below will surface a clearer error if
+                    # something is actually wrong with the backend setup.
+                    Write-Warning ("Could not list current deployments: {0}" -f $_.Exception.Message)
                 }
-                Write-Host ''
+    
+                # When we got here through the menu, $Description is unset; ask
+                # for it interactively. When -Description was passed on the
+                # command line it has already been validated non-empty.
+                if ([string]::IsNullOrWhiteSpace($Description)) {
+                    $Description = Read-Host 'Enter a description for the new deployment'
+                    if ([string]::IsNullOrWhiteSpace($Description)) {
+                        throw 'Description cannot be empty.'
+                    }
+                }
+    
+                $newDep = Invoke-PushDeployment -Path $BackendPath -Description $Description
+                if ($newDep) {
+                    Write-Host ''
+                    Write-Host ("New deployment : {0}" -f $newDep.Id) -ForegroundColor Green
+                    Write-Host ("Version        : {0}" -f $newDep.Version) -ForegroundColor Green
+                    Write-Host ("Description    : {0}" -f $newDep.Description) -ForegroundColor Green
+                    Write-Host ("URL            : {0}" -f $newDep.Url) -ForegroundColor Green
+                    Write-Host ''
+    
+                    Write-ReleaseInfo -File $ReleaseInfoFile -Deployment $newDep
+                    Write-Host "Wrote release info to $ReleaseInfoFile" -ForegroundColor Green
+                }
+            }
+            'Undeploy' {
+                if ($UndeployAll) {
+                    Write-Host ("Undeploying all deployments from {0}..." -f $BackendPath) -ForegroundColor Cyan
+                    Invoke-Undeploy -Path $BackendPath -All
+                    Write-Host ''
+                    Write-Host 'Undeployed all deployments' -ForegroundColor Green
+                    Clear-ReleaseInfo -File $ReleaseInfoFile
+                }
+                elseif ($UndeployId) {
+                    Write-Host ("Undeploying {0} from {1}..." -f $UndeployId, $BackendPath) -ForegroundColor Cyan
+                    Invoke-Undeploy -Path $BackendPath -DeploymentId $UndeployId
+                    Write-Host ''
+                    Write-Host ("Undeployed {0}" -f $UndeployId) -ForegroundColor Green
+                    Clear-ReleaseInfo -File $ReleaseInfoFile -DeploymentId $UndeployId
+                }
+                else {
+                    # Interactive: pick single vs all first.
+                    $subChoice = Show-ListPicker -Options @(
+                        [pscustomobject]@{ Key = 'Single'; Label = 'Undeploy a single deployment (pick from list)' }
+                        [pscustomobject]@{ Key = 'All';    Label = 'Undeploy ALL deployments' }
+                    ) -Title 'Undeploy: single or all?'
 
-                Write-NetlifyReleaseInfo -File $NetlifyReleaseInfoFile -Deployment $result
-                Write-Host "Wrote Netlify release info to $NetlifyReleaseInfoFile" -ForegroundColor Green
+                    if (-not $subChoice) {
+                        Write-Host 'Cancelled. No changes made.' -ForegroundColor Yellow
+                    }
+                    elseif ($subChoice.Key -eq 'All') {
+                        Write-Host ''
+                        Write-Host "This will undeploy EVERY deployment in $BackendPath." -ForegroundColor Yellow
+                        Write-Host 'If the frontend API_URL in Index.html still points to one of them,' -ForegroundColor Yellow
+                        Write-Host 'update it via option 1 (Update) before going further.' -ForegroundColor Yellow
+                        Write-Host ''
+                        $confirm = Read-Host "Type 'yes' to undeploy ALL deployments"
+                        if ($confirm -ne 'yes') {
+                            Write-Host 'Cancelled. No changes made.' -ForegroundColor Yellow
+                        } else {
+                            Invoke-Undeploy -Path $BackendPath -All
+                            Write-Host ''
+                            Write-Host 'Undeployed all deployments' -ForegroundColor Green
+                            Clear-ReleaseInfo -File $ReleaseInfoFile
+                        }
+                    }
+                    else {
+                        $items = @(Get-DeploymentsJson -Path $BackendPath | ForEach-Object {
+                            [pscustomobject]@{
+                                Id          = [string] $_.DeploymentId
+                                Version     = if ($null -eq $_.VersionNumber) { '' } else { [string] $_.VersionNumber }
+                                Description = if ($null -eq $_.Description) { '' } else { [string] $_.Description }
+                                Url         = "https://script.google.com/macros/s/$([string] $_.DeploymentId)/exec"
+                            }
+                        })
+                        if ($items.Count -eq 0) {
+                            $items = Get-Deployments -Path $BackendPath
+                        }
+                        if (-not $items -or $items.Count -eq 0) {
+                            Write-Host "No deployments available for $BackendPath." -ForegroundColor Yellow
+                            exit 1
+                        }
+
+                        $items = @(
+                            $items |
+                            ForEach-Object {
+                                $verText = [string] $_.Version
+                                $verNum = if ($verText -match '^\d+$') { [int] $verText } else { -1 }
+                                [pscustomobject]@{
+                                    SortVersion = $verNum
+                                    SortId      = [string] $_.Id
+                                    Item        = $_
+                                }
+                            } |
+                            Sort-Object -Property SortVersion, SortId -Descending |
+                            ForEach-Object { $_.Item }
+                        )
+
+                        if ($items.Count -eq 1) {
+                            $choice = $items[0]
+                            Write-Host ("Only one deployment found, will undeploy {0} ({1})." -f $choice.Version, $choice.Id) -ForegroundColor Yellow
+                        } else {
+                            $choice = Show-Picker -Items $items -Title "Select deployment to undeploy ($BackendPath)"
+                            if (-not $choice) {
+                                Write-Host "Cancelled. No changes made." -ForegroundColor Yellow
+                                exit 2
+                            }
+                        }
+
+                        Write-Host ''
+                        Write-Host "About to undeploy:" -ForegroundColor Yellow
+                        Write-Host ("  Id          : {0}" -f $choice.Id) -ForegroundColor Yellow
+                        Write-Host ("  Version     : {0}" -f $choice.Version) -ForegroundColor Yellow
+                        Write-Host ("  Description : {0}" -f $choice.Description) -ForegroundColor Yellow
+                        Write-Host ("  URL         : {0}" -f $choice.Url) -ForegroundColor Yellow
+                        Write-Host ''
+                        Write-Host "NOTE: If the frontend API_URL in Index.html points to this deployment," -ForegroundColor Red
+                        Write-Host "      update it via option 1 (or deploy + Update) to avoid a broken frontend." -ForegroundColor Red
+                        Write-Host ''
+                        $confirm = Read-Host "Type 'yes' to confirm undeploy"
+                        if ($confirm -ne 'yes') {
+                            Write-Host "Cancelled. No changes made." -ForegroundColor Yellow
+                            exit 2
+                        }
+
+                        Invoke-Undeploy -Path $BackendPath -DeploymentId $choice.Id
+                        Write-Host ''
+                        Write-Host ("Undeployed {0}" -f $choice.Id) -ForegroundColor Green
+                        Clear-ReleaseInfo -File $ReleaseInfoFile -DeploymentId $choice.Id
+                    }
+                }
+            }
+            'Localhost' {
+                $frontendFolder = Split-Path -Path $FrontendFile -Parent
+                Start-LocalhostServer -FrontendPath $frontendFolder
+            }
+            'Netlify' {
+                $frontendFolder = Split-Path -Path $FrontendFile -Parent
+                $result = Invoke-NetlifyDeploy -Path $frontendFolder
+                if ($result) {
+                    Write-Host ''
+                    if ($result.ProductionUrl) {
+                        Write-Host ("Production URL : {0}" -f $result.ProductionUrl) -ForegroundColor Green
+                    }
+                    if ($result.UniqueUrl) {
+                        Write-Host ("Unique URL     : {0}" -f $result.UniqueUrl) -ForegroundColor Green
+                    }
+                    Write-Host ''
+    
+                    Write-NetlifyReleaseInfo -File $NetlifyReleaseInfoFile -Deployment $result
+                    Write-Host "Wrote Netlify release info to $NetlifyReleaseInfoFile" -ForegroundColor Green
+                }
             }
         }
+
+        if ($singleShot) {
+            break
+        }
+
+        Write-Host ''
+        Write-Host 'Press any key to return to the menu (Esc to exit)...' -ForegroundColor DarkGray
+        $null = [Console]::ReadKey($true)
+        $mode = $null
     }
 }
 catch {
