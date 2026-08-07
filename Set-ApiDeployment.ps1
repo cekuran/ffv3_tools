@@ -851,7 +851,7 @@ function Get-CloudflareWorkerUrl {
     }
     $emailBase = ($emailMatch.Value -split '@')[0]
 
-    return "https://$emailBase.$workerName.workers.dev"
+    return "https://$workerName.$emailBase.workers.dev"
 }
 
 function Invoke-SeedReleaseInfo {
