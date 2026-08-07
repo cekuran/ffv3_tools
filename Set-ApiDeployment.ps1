@@ -545,6 +545,43 @@ function Set-ApiUrlInFile {
     }
 }
 
+function Set-WranglerTarget {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)] [string] $File,
+        [Parameter(Mandatory)] [string] $Target
+    )
+
+    if (-not (Test-Path -LiteralPath $File)) {
+        throw "wrangler.toml not found: $File"
+    }
+    $content = Get-Content -LiteralPath $File -Raw -Encoding UTF8
+    $pattern = '(?m)^(\s*TARGET\s*=\s*")[^"]*("\s*)$'
+    if ($content -notmatch $pattern) {
+        throw "Could not find 'TARGET = ""...""' in $File"
+    }
+
+    $newContent = [regex]::Replace($content, $pattern, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m) "$($m.Groups[1].Value)$Target$($m.Groups[2].Value)"
+    }, 1)
+
+    if ($PSCmdlet.ShouldProcess($File, "Update TARGET to $Target")) {
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText((Resolve-Path -LiteralPath $File).Path, $newContent, $utf8NoBom)
+    }
+}
+
+function Get-WranglerTarget {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $File)
+
+    if (-not (Test-Path -LiteralPath $File)) { return $null }
+    $content = Get-Content -LiteralPath $File -Raw -Encoding UTF8
+    $pattern = '(?m)^\s*TARGET\s*=\s*"(?<v>[^"]*)"\s*$'
+    if ($content -match $pattern) { return $matches['v'] }
+    return $null
+}
+
 function Start-LocalhostServer {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [string] $FrontendPath)
@@ -937,9 +974,28 @@ function Invoke-SeedReleaseInfo {
     }
 }
 
+function Test-AppsScriptDeployment {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $Url)
+
+    # Apps Script web apps accept GET. A 2xx/3xx means the deployment is live;
+    # any exception or non-success status means it's gone or unreachable. 10s
+    # timeout so a zombie URL doesn't stall the deploy.
+    try {
+        $response = Invoke-WebRequest -Uri $Url -Method Get -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+        return [bool]($response.StatusCode -ge 200 -and $response.StatusCode -lt 400)
+    }
+    catch {
+        return $false
+    }
+}
+
 function Invoke-WranglerDeploy {
     [CmdletBinding(SupportsShouldProcess = $true)]
-    param([Parameter(Mandatory)] [string] $ProxyPath)
+    param(
+        [Parameter(Mandatory)] [string] $ProxyPath,
+        [string] $Target
+    )
 
     if (-not (Test-Path -LiteralPath $ProxyPath)) {
         throw "Proxy folder not found: $ProxyPath"
@@ -967,14 +1023,23 @@ function Invoke-WranglerDeploy {
         }
     }
 
-    if (-not $PSCmdlet.ShouldProcess("$ProxyPath (npx wrangler deploy)", 'Deploy Worker')) {
-        Write-Host "[WhatIf] Would run: npx wrangler deploy in $ProxyPath" -ForegroundColor DarkGray
+    # Build the wrangler deploy command. Pass --var TARGET:<url> when the
+    # caller picked a specific Apps Script deployment so this deploy uses it
+    # even if the wrangler.toml edit upstream was bypassed for any reason.
+    $wranglerArgs = @('deploy')
+    if ($Target) {
+        $wranglerArgs += @('--var', "TARGET:$Target")
+    }
+    $cmdDisplay = $wranglerArgs -join ' '
+
+    if (-not $PSCmdlet.ShouldProcess("$ProxyPath (npx wrangler $cmdDisplay)", 'Deploy Worker')) {
+        Write-Host "[WhatIf] Would run: npx wrangler $cmdDisplay in $ProxyPath" -ForegroundColor DarkGray
         return $null
     }
 
     Push-Location -LiteralPath $ProxyPath
     try {
-        $raw = & npx wrangler deploy 2>&1
+        $raw = & npx wrangler @wranglerArgs 2>&1
         $exit = $LASTEXITCODE
     }
     finally {
@@ -1336,7 +1401,72 @@ try {
                 }
             }
             'Proxy' {
-                $result = Invoke-WranglerDeploy -ProxyPath $ProxyPath
+                # Pick the Apps Script deployment this Worker should target. The
+                # picked URL is written to wrangler.toml's [vars].TARGET and also
+                # passed as a runtime override to this deploy so the new target is
+                # live even if the file edit is bypassed for any reason. The first
+                # picker row is a no-op sentinel so the user can redeploy without
+                # touching wrangler.toml.
+                $items = @(Get-SortedDeployments -Path $BackendPath)
+                if ($items.Count -eq 0) {
+                    Write-Host "No Apps Script deployments available for $BackendPath." -ForegroundColor Yellow
+                    break
+                }
+
+                $tomlPath = Join-Path $ProxyPath 'wrangler.toml'
+                $currentTarget = Get-WranglerTarget -File $tomlPath
+                $keepSentinel = [pscustomobject]@{
+                    Id          = '<keep>'
+                    Version     = ''
+                    Description = if ($currentTarget) { "Keep current TARGET ($currentTarget)" } else { 'Keep current TARGET' }
+                    Url         = $currentTarget
+                }
+                $pickerItems = @($keepSentinel) + @($items)
+
+                $choice = Show-Picker -Items $pickerItems -Title "Pick the Apps Script deployment the Worker should target ($BackendPath)"
+                if (-not $choice) {
+                    Write-Host "Cancelled. No changes made." -ForegroundColor Yellow
+                    break
+                }
+
+                $keepCurrent = [string]$choice.Id -eq '<keep>'
+                $targetUrl = [string]$choice.Url
+
+                Write-Host ''
+                if ($keepCurrent) {
+                    Write-Host 'Selected : Keep current TARGET' -ForegroundColor Green
+                    Write-Host ("Target   : {0}" -f $targetUrl) -ForegroundColor Green
+                }
+                else {
+                    Write-Host ("Selected : {0}" -f $choice.Id) -ForegroundColor Green
+                    Write-Host ("Version  : {0}" -f $choice.Version) -ForegroundColor Green
+                    Write-Host ("Desc     : {0}" -f $choice.Description) -ForegroundColor Green
+                    Write-Host ("Target   : {0}" -f $targetUrl) -ForegroundColor Green
+                }
+                Write-Host ''
+
+                # Validate the target actually responds so we don't point the Worker
+                # at a deployment that has since been undeployed.
+                Write-Host ("Validating target {0}..." -f $targetUrl) -ForegroundColor Cyan
+                if (-not (Test-AppsScriptDeployment -Url $targetUrl)) {
+                    Write-Warning ("Apps Script target {0} did not respond. The deployment may have been undeployed or removed." -f $targetUrl)
+                    $yn = Read-Host 'Continue anyway? (y/n)'
+                    if ($yn -ne 'y') {
+                        Write-Host 'Cancelled.' -ForegroundColor Yellow
+                        break
+                    }
+                }
+                else {
+                    Write-Host 'Target responded OK.' -ForegroundColor Green
+                }
+                Write-Host ''
+
+                if (-not $keepCurrent) {
+                    Set-WranglerTarget -File $tomlPath -Target $targetUrl
+                    Write-Host ("Updated TARGET in {0}" -f $tomlPath) -ForegroundColor Green
+                }
+
+                $result = Invoke-WranglerDeploy -ProxyPath $ProxyPath -Target $targetUrl
                 if ($result -and $result.WorkerUrl) {
                     Update-ReleaseInfoSection -File $ReleaseInfoFile -Section 'cloudflare' -Entries @{ WorkerUrl = $result.WorkerUrl }
                     Write-Host ("Saved Worker URL to [cloudflare] section of {0}" -f $ReleaseInfoFile) -ForegroundColor Green
