@@ -1546,6 +1546,11 @@ try {
                 }
     
                 $newDep = Invoke-PushDeployment -Path $BackendPath -Description $Description
+                # ponytail: limpia $Description para que la próxima vez que el
+                # usuario elija Deploy desde el menú se le vuelva a pedir (si
+                # no, IsNullOrWhiteSpace da false y reutiliza la descripción
+                # anterior en silencio).
+                $Description = $null
                 if ($newDep) {
                     Write-Host ''
                     Write-Host ("New deployment : {0}" -f $newDep.Id) -ForegroundColor Green
