@@ -1239,6 +1239,38 @@ function Invoke-Undeploy {
     foreach ($line in @($raw | Where-Object { $_ -is [string] })) {
         Write-Host $line
     }
+
+    # Verify the undeploy actually archived. clasp undeploy exits 0 even
+    # when the Apps Script API silently rejects the archive request, so the
+    # deployment can stay "Active" in GAS online. Give the API a moment,
+    # list deployments again, and warn if the target is still there.
+    Start-Sleep -Seconds 2
+    try {
+        $remaining = @(Get-SortedDeployments -Path $Path)
+        $stillActive = $false
+        if ($All) {
+            if ($remaining.Count -gt 0) {
+                $stillActive = $true
+                Write-Warning ("clasp undeploy --all returned success but {0} deployment(s) still appear active:" -f $remaining.Count)
+                foreach ($item in $remaining) {
+                    Write-Warning ("  - {0} @{1}" -f $item.Id, $item.Version)
+                }
+            }
+        }
+        elseif ($DeploymentId) {
+            $match = @($remaining | Where-Object { [string]$_.Id -eq $DeploymentId })
+            if ($match.Count -gt 0) {
+                $stillActive = $true
+                Write-Warning ("Deployment {0} still appears in the list after undeploy." -f $DeploymentId)
+            }
+        }
+        if ($stillActive) {
+            Write-Warning 'Confirm in GAS online (Deploy > Manage deployments). If shown as Active, archive by hand (Archive button).'
+        }
+    }
+    catch {
+        Write-Verbose ("Post-undeploy verification failed: {0}" -f $_.Exception.Message)
+    }
 }
 
 function Invoke-NetlifyDeploy {
