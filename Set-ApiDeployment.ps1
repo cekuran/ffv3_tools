@@ -1535,10 +1535,13 @@ try {
                     Write-Warning ("Could not list current deployments: {0}" -f $_.Exception.Message)
                 }
     
-                # When we got here through the menu, $Description is unset; ask
-                # for it interactively. When -Description was passed on the
-                # command line it has already been validated non-empty.
-                if ([string]::IsNullOrWhiteSpace($Description)) {
+                # CLI mode (-Description passed): value already bound and validated.
+                # Menu mode: always prompt, otherwise the previous description
+                # gets reused silently. $PSBoundParameters distinguishes both
+                # without reassigning to $Description (which would trip
+                # [ValidateNotNullOrEmpty()] on the parameter — see
+                # https://github.com/PowerShell/PowerShell/issues/14230).
+                if (-not $PSBoundParameters.ContainsKey('Description')) {
                     $Description = Read-Host 'Enter a description for the new deployment'
                     if ([string]::IsNullOrWhiteSpace($Description)) {
                         throw 'Description cannot be empty.'
@@ -1546,11 +1549,6 @@ try {
                 }
     
                 $newDep = Invoke-PushDeployment -Path $BackendPath -Description $Description
-                # ponytail: limpia $Description para que la próxima vez que el
-                # usuario elija Deploy desde el menú se le vuelva a pedir (si
-                # no, IsNullOrWhiteSpace da false y reutiliza la descripción
-                # anterior en silencio).
-                $Description = $null
                 if ($newDep) {
                     Write-Host ''
                     Write-Host ("New deployment : {0}" -f $newDep.Id) -ForegroundColor Green
