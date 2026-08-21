@@ -4,7 +4,7 @@
     Manages Google Apps Script deployments for the backend project.
 
 .DESCRIPTION
-    Eight actions are available and chosen interactively from a keyboard
+    Nine actions are available and chosen interactively from a keyboard
     picker (Up/Down to move, Enter to select, Esc to cancel). After every
     action except Exit, the script pauses and shows the menu again so you
     can chain multiple actions in a single run:
@@ -54,7 +54,13 @@
          section (one query per section: clasp, wrangler, netlify). Any
          section that cannot be queried is left as-is.
 
-      8. Exit the script.
+      8. Start the local Cloudflare Worker dev server (proxy/): installs
+         deps if needed, reads the current TARGET from wrangler.toml,
+         then launches `npx wrangler dev` in a new terminal window.
+         After starting, optionally rewrites API_URL in index.html to
+         http://127.0.0.1:8787 so the frontend talks to the local proxy.
+
+      9. Exit the script.
 
     When -Description, -UndeployId, or -UndeployAll is supplied on the
     command line the picker is skipped and the matching action runs
@@ -453,7 +459,7 @@ function Show-Picker {
 
 function Show-MainMenu {
     # Top-level action picker. Returns the chosen action key
-    # ('Update', 'Deploy', 'Undeploy', 'Localhost', 'Proxy', 'Netlify', 'Seed' or 'Exit') or $null if the user cancels.
+    # ('Update', 'Deploy', 'Undeploy', 'Localhost', 'Proxy', 'Netlify', 'Seed', 'ProxyDev' or 'Exit') or $null if the user cancels.
     $options = @(
         [pscustomobject]@{ Key = 'Update';    Label = 'Update API_URL in index.html' }
         [pscustomobject]@{ Key = 'Deploy';    Label = 'Deploy a new Apps Script version' }
@@ -462,6 +468,7 @@ function Show-MainMenu {
         [pscustomobject]@{ Key = 'Netlify';   Label = 'Deploy the frontend over Netlify' }
         [pscustomobject]@{ Key = 'Seed';      Label = 'Seed release_info.txt from current deployments' }
         [pscustomobject]@{ Key = 'Localhost'; Label = 'Start a local HTTP server in the frontend folder' }
+        [pscustomobject]@{ Key = 'ProxyDev';  Label = 'Start local Cloudflare Worker dev server (wrangler dev)' }
         [pscustomobject]@{ Key = 'Exit';      Label = 'Exit the script' }
     )
     $choice = Show-ListPicker -Options $options -Title 'Choose an action:'
@@ -515,6 +522,89 @@ function Show-ListPicker {
     finally {
         [Console]::ResetColor()
         Clear-Host
+    }
+}
+
+function Start-LocalProxy {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)] [string] $ProxyPath,
+        [Parameter(Mandatory)] [string] $FrontendFile
+    )
+
+    if (-not (Test-Path -LiteralPath $ProxyPath)) {
+        throw "Proxy folder not found: $ProxyPath"
+    }
+    if (-not (Get-Command npx -ErrorAction SilentlyContinue)) {
+        throw "npx not found. Install Node.js."
+    }
+
+    # First-run bootstrap: install deps if node_modules is missing.
+    $nodeModules = Join-Path $ProxyPath 'node_modules'
+    if (-not (Test-Path -LiteralPath $nodeModules)) {
+        Write-Host 'Installing proxy dependencies...' -ForegroundColor Cyan
+        if ($PSCmdlet.ShouldProcess("$ProxyPath (npm install)", 'Install proxy deps')) {
+            Push-Location -LiteralPath $ProxyPath
+            try {
+                $installOut = & npm install 2>&1
+                $installExit = $LASTEXITCODE
+            }
+            finally {
+                Pop-Location
+            }
+            if ($installExit -ne 0) {
+                throw "npm install failed (exit $installExit):`n$installOut"
+            }
+        }
+    }
+
+    $tomlPath = Join-Path $ProxyPath 'wrangler.toml'
+    $currentTarget = Get-WranglerTarget -File $tomlPath
+    $localUrl = 'http://127.0.0.1:8787'
+
+    Write-Host ''
+    Write-Host ("Proxy folder     : {0}" -f $ProxyPath) -ForegroundColor Cyan
+    Write-Host ("Local URL        : {0}" -f $localUrl) -ForegroundColor Cyan
+    if ($currentTarget) {
+        Write-Host ("TARGET (upstream): {0}" -f $currentTarget) -ForegroundColor Cyan
+    } else {
+        Write-Warning 'No TARGET found in wrangler.toml. The proxy will start but requests will fail without a valid upstream.'
+    }
+    Write-Host ''
+
+    if ($WhatIfPreference) {
+        Write-Host "[WhatIf] Would run: npx wrangler dev in a new window ($ProxyPath)." -ForegroundColor DarkGray
+        return
+    }
+
+    # Launch wrangler dev in a new console window so the user can see its logs
+    # and stop it with Ctrl+C without blocking this script.
+    Start-Process -FilePath 'npx' -ArgumentList @('wrangler', 'dev') -WorkingDirectory $ProxyPath
+
+    Start-Sleep -Milliseconds 1500
+    Write-Host ("Wrangler dev started in a new window. Listening at {0}" -f $localUrl) -ForegroundColor Green
+    Write-Host ''
+
+    # Offer to point API_URL in the frontend at the local proxy.
+    $currentApiUrl = $null
+    if (Test-Path -LiteralPath $FrontendFile) {
+        $content = Get-Content -LiteralPath $FrontendFile -Raw -Encoding UTF8
+        if ($content -match "(const\s+API_URL\s*=\s*')([^']*)(';\.?)") {
+            $currentApiUrl = $matches[2]
+        }
+    }
+
+    if ($currentApiUrl -ne $localUrl) {
+        if ($currentApiUrl) {
+            Write-Host ("Current API_URL: {0}" -f $currentApiUrl) -ForegroundColor DarkGray
+        }
+        $yn = Read-Host "Update API_URL in index.html to $localUrl? (y/n)"
+        if ($yn -eq 'y') {
+            Set-ApiUrlInFile -File $FrontendFile -Url $localUrl
+            Write-Host ("Updated API_URL to {0}" -f $localUrl) -ForegroundColor Green
+        }
+    } else {
+        Write-Host ("API_URL already points to {0}" -f $localUrl) -ForegroundColor Green
     }
 }
 
@@ -1534,7 +1624,7 @@ try {
                     # something is actually wrong with the backend setup.
                     Write-Warning ("Could not list current deployments: {0}" -f $_.Exception.Message)
                 }
-    
+
                 # CLI mode (-Description passed): value already bound and validated.
                 # Menu mode: always prompt, otherwise the previous description
                 # gets reused silently. $PSBoundParameters distinguishes both
@@ -1547,7 +1637,7 @@ try {
                         throw 'Description cannot be empty.'
                     }
                 }
-    
+
                 $newDep = Invoke-PushDeployment -Path $BackendPath -Description $Description
                 if ($newDep) {
                     Write-Host ''
@@ -1669,6 +1759,9 @@ try {
             'Localhost' {
                 $frontendFolder = Split-Path -Path $FrontendFile -Parent
                 Start-LocalhostServer -FrontendPath $frontendFolder
+            }
+            'ProxyDev' {
+                Start-LocalProxy -ProxyPath $ProxyPath -FrontendFile $FrontendFile
             }
             'Seed' {
                 Invoke-SeedReleaseInfo -BackendPath $BackendPath -ProxyPath $ProxyPath -File $ReleaseInfoFile
