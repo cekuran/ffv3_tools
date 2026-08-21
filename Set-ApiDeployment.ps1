@@ -579,7 +579,13 @@ function Start-LocalProxy {
 
     # Launch wrangler dev in a new console window so the user can see its logs
     # and stop it with Ctrl+C without blocking this script.
-    Start-Process -FilePath 'npx' -ArgumentList @('wrangler', 'dev') -WorkingDirectory $ProxyPath
+    # npx is a .cmd script on Windows so Start-Process can't launch it directly
+    # as a windowed process. We wrap it in a new pwsh window instead.
+    $escapedPath = $ProxyPath -replace "'", "''"
+    Start-Process -FilePath 'pwsh' -ArgumentList @(
+        '-NoExit', '-Command',
+        "Set-Location -LiteralPath '$escapedPath'; npx wrangler dev"
+    )
 
     Start-Sleep -Milliseconds 1500
     Write-Host ("Wrangler dev started in a new window. Listening at {0}" -f $localUrl) -ForegroundColor Green
