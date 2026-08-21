@@ -1197,6 +1197,9 @@ function Invoke-PushDeployment {
         if ($pushExit -ne 0) {
             throw "clasp push failed (exit $pushExit):`n$pushOut"
         }
+        foreach ($line in @($pushOut | Where-Object { $_ -is [string] })) {
+            Write-Host $line
+        }
         Write-Host "Pushed backend files from $Path" -ForegroundColor Green
     }
 
