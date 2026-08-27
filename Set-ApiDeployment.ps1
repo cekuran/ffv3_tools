@@ -1101,6 +1101,9 @@ function Invoke-PushDeployment {
         if ($pushExit -ne 0) {
             throw "clasp push failed (exit $pushExit):`n$pushOut"
         }
+        foreach ($line in @($pushOut | Where-Object { $_ -is [string] })) {
+            Write-Host $line
+        }
         Write-Host "Pushed backend files from $Path" -ForegroundColor Green
     }
 
@@ -1534,7 +1537,7 @@ try {
                     # something is actually wrong with the backend setup.
                     Write-Warning ("Could not list current deployments: {0}" -f $_.Exception.Message)
                 }
-    
+
                 # CLI mode (-Description passed): value already bound and validated.
                 # Menu mode: always prompt, otherwise the previous description
                 # gets reused silently. $PSBoundParameters distinguishes both
@@ -1547,7 +1550,7 @@ try {
                         throw 'Description cannot be empty.'
                     }
                 }
-    
+
                 $newDep = Invoke-PushDeployment -Path $BackendPath -Description $Description
                 if ($newDep) {
                     Write-Host ''
