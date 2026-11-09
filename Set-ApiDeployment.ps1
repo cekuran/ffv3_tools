@@ -24,6 +24,11 @@
          [cloudflare] section of release_info.txt so the next run does
          not prompt again.
 
+         The same sub-picker lists named URLs saved in the [api-urls]
+         section of release_info.txt (marking the current one) and lets
+         you add or remove entries, so the frontend can be switched
+         between several backends.
+
       2. Deploy a new Apps Script version: runs `clasp push` followed by
          `clasp deploy -d <description>`, then shows the resulting
          deployment (id and description) and writes it to release_info.txt.
@@ -60,7 +65,13 @@
          After starting, optionally rewrites API_URL in index.html to
          http://127.0.0.1:8787 so the frontend talks to the local proxy.
 
-      9. Exit the script.
+      9. Update proxy/ and proxy_oppo/ with an Apps Script deployment
+         URL: rewrites TARGET in proxy/wrangler.toml and DEFAULT_TARGET in
+         proxy/src/index.js and proxy_oppo/src/index.js, and TARGET in
+         proxy_oppo/.proxy-oppo.env. Does not deploy.
+         Also offered right after action 2 (or forced with -UpdateProxies).
+
+     10. Exit the script.
 
     When -Description, -UndeployId, or -UndeployAll is supplied on the
     command line the picker is skipped and the matching action runs
@@ -82,12 +93,21 @@
         [google-app-script]  DeploymentId / Version / Description / Url
         [cloudflare]         WorkerUrl
         [netlify]            ProductionUrl / UniqueUrl
+        [api-urls]           <Name> : <URL> (named API_URL targets)
 
     Each action writes only its own section; the others are preserved.
 
 .PARAMETER ProxyPath
     Path to the proxy folder (must contain package.json and wrangler.toml).
     Defaults to "../proxy" relative to this script.
+
+.PARAMETER ProxyOppoPath
+    Path to the Node-hosted proxy folder (must contain src/index.js).
+    Defaults to "../proxy_oppo" relative to this script.
+
+.PARAMETER UpdateProxies
+    With -Description: after the deploy, update proxy/ and proxy_oppo/ to
+    the new deployment URL without prompting.
 
 .PARAMETER DeploymentId
     Apps Script deployment id to use as the new API_URL in single-shot
@@ -147,8 +167,10 @@ param(
     [string] $FrontendFile = (Join-Path $PSScriptRoot '..' 'frontend' 'index.html'),
     [string] $ReleaseInfoFile = (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'release_info.txt'),
     [string] $ProxyPath = (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'proxy'),
+    [string] $ProxyOppoPath = (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'proxy_oppo'),
     [ValidateNotNullOrEmpty()]
     [string] $Description,
+    [switch] $UpdateProxies,
     [ValidateNotNullOrEmpty()]
     [string] $UndeployId,
     [ValidateNotNullOrEmpty()]
@@ -469,6 +491,7 @@ function Show-MainMenu {
         [pscustomobject]@{ Key = 'Seed';      Label = 'Seed release_info.txt from current deployments' }
         [pscustomobject]@{ Key = 'Localhost'; Label = 'Start a local HTTP server in the frontend folder' }
         [pscustomobject]@{ Key = 'ProxyDev';  Label = 'Start local Cloudflare Worker dev server (wrangler dev)' }
+        [pscustomobject]@{ Key = 'SyncProxies'; Label = 'Update proxy/ and proxy_oppo/ with an Apps Script deployment URL' }
         [pscustomobject]@{ Key = 'Exit';      Label = 'Exit the script' }
     )
     $choice = Show-ListPicker -Options $options -Title 'Choose an action:'
@@ -665,6 +688,91 @@ function Set-WranglerTarget {
         $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
         [System.IO.File]::WriteAllText((Resolve-Path -LiteralPath $File).Path, $newContent, $utf8NoBom)
     }
+}
+
+function Set-ProxyDefaultTarget {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)] [string] $File,
+        [Parameter(Mandatory)] [string] $Target
+    )
+
+    if (-not (Test-Path -LiteralPath $File)) {
+        throw "Proxy source not found: $File"
+    }
+    $content = Get-Content -LiteralPath $File -Raw -Encoding UTF8
+    $pattern = "(const\s+DEFAULT_TARGET\s*=\s*['""])[^'""]*(['""];)"
+    if ($content -notmatch $pattern) {
+        throw "Could not find 'const DEFAULT_TARGET = ...;' in $File"
+    }
+    $newContent = [regex]::Replace($content, $pattern, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m) "$($m.Groups[1].Value)$Target$($m.Groups[2].Value)"
+    }, 1)
+
+    if ($PSCmdlet.ShouldProcess($File, "Update DEFAULT_TARGET to $Target")) {
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText((Resolve-Path -LiteralPath $File).Path, $newContent, $utf8NoBom)
+    }
+}
+
+function Set-EnvFileTarget {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)] [string] $File,
+        [Parameter(Mandatory)] [string] $Target
+    )
+
+    if (-not (Test-Path -LiteralPath $File)) {
+        throw "Env file not found: $File"
+    }
+    $content = Get-Content -LiteralPath $File -Raw -Encoding UTF8
+    if ($null -eq $content) { $content = '' }
+    $pattern = '(?m)^(\s*TARGET\s*=\s*).*?(\r?)$'
+    if ($content -match $pattern) {
+        $newContent = [regex]::Replace($content, $pattern, [System.Text.RegularExpressions.MatchEvaluator]{
+            param($m) "$($m.Groups[1].Value)$Target$($m.Groups[2].Value)"
+        }, 1)
+    } else {
+        $sep = if ($content -and -not $content.EndsWith("`n")) { "`n" } else { '' }
+        $newContent = "$content${sep}TARGET=$Target`n"
+    }
+
+    if ($PSCmdlet.ShouldProcess($File, "Update TARGET to $Target")) {
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText((Resolve-Path -LiteralPath $File).Path, $newContent, $utf8NoBom)
+    }
+}
+
+function Update-ProxyTargets {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)] [string] $Url,
+        [Parameter(Mandatory)] [string] $ProxyPath,
+        [Parameter(Mandatory)] [string] $ProxyOppoPath
+    )
+
+    $targets = @(
+        @{ Kind = 'toml'; File = (Join-Path $ProxyPath 'wrangler.toml') }
+        @{ Kind = 'js';   File = (Join-Path $ProxyPath 'src' 'index.js') }
+        @{ Kind = 'js';   File = (Join-Path $ProxyOppoPath 'src' 'index.js') }
+        @{ Kind = 'env';  File = (Join-Path $ProxyOppoPath '.proxy-oppo.env') }
+    )
+    foreach ($t in $targets) {
+        try {
+            if ($t.Kind -eq 'toml') {
+                Set-WranglerTarget -File $t.File -Target $Url
+            } elseif ($t.Kind -eq 'env') {
+                Set-EnvFileTarget -File $t.File -Target $Url
+            } else {
+                Set-ProxyDefaultTarget -File $t.File -Target $Url
+            }
+            Write-Host ("Updated {0}" -f $t.File) -ForegroundColor Green
+        }
+        catch {
+            Write-Warning ("Could not update {0}: {1}" -f $t.File, $_.Exception.Message)
+        }
+    }
+    Write-Host 'Proxies not redeployed. Use the Cloudflare option and restart proxy_oppo to apply.' -ForegroundColor DarkGray
 }
 
 function Get-WranglerTarget {
@@ -1495,14 +1603,69 @@ try {
                     $url = $ApiUrl
                 }
                 else {
-                    # Interactive picker.
-                    $subChoice = Show-ListPicker -Options @(
-                        [pscustomobject]@{ Key = 'Local';      Label = 'Local proxy (http://127.0.0.1:8787)' }
-                        [pscustomobject]@{ Key = 'Cloudflare'; Label = 'Cloudflare Worker URL (saved for next time)' }
-                    ) -Title 'Where should API_URL point to?'
+                    # Interactive picker. Named URLs live in the [api-urls] section of release_info.txt.
+                    $saved = Read-ReleaseInfoSection -File $ReleaseInfoFile -Section 'api-urls'
+                    if (-not $saved) { $saved = @{} }
+                    $currentApiUrl = $null
+                    if ((Test-Path -LiteralPath $FrontendFile) -and ((Get-Content -LiteralPath $FrontendFile -Raw -Encoding UTF8) -match "const\s+API_URL\s*=\s*'([^']*)';")) {
+                        $currentApiUrl = $matches[1]
+                    }
+
+                    $options = @()
+                    foreach ($name in ($saved.Keys | Sort-Object)) {
+                        $mark = if ($saved[$name] -eq $currentApiUrl) { '  (current)' } else { '' }
+                        $options += [pscustomobject]@{ Key = 'Saved'; Name = $name; Url = $saved[$name]; Label = "$name -> $($saved[$name])$mark" }
+                    }
+                    $options += [pscustomobject]@{ Key = 'Local';      Label = 'Local proxy (http://127.0.0.1:8787)' }
+                    $options += [pscustomobject]@{ Key = 'Cloudflare'; Label = 'Cloudflare Worker URL (saved for next time)' }
+                    $options += [pscustomobject]@{ Key = 'Add';        Label = 'Add a named URL...' }
+                    if ($saved.Count -gt 0) {
+                        $options += [pscustomobject]@{ Key = 'Remove'; Label = 'Remove a named URL...' }
+                    }
+
+                    $title = if ($currentApiUrl) { "Where should API_URL point to? (current: $currentApiUrl)" } else { 'Where should API_URL point to?' }
+                    $subChoice = Show-ListPicker -Options $options -Title $title
 
                     if (-not $subChoice) {
                         Write-Host 'Cancelled. No changes made.' -ForegroundColor Yellow
+                    }
+                    elseif ($subChoice.Key -eq 'Saved') {
+                        $url = $subChoice.Url
+                    }
+                    elseif ($subChoice.Key -eq 'Add') {
+                        $name = (Read-Host 'Name (no spaces, e.g. oppo, worker, local)').Trim()
+                        $newUrl = (Read-Host 'URL (http:// or https://)').Trim()
+                        if ($name -notmatch '^\S+$') {
+                            Write-Host 'Invalid name. It cannot be empty or contain spaces.' -ForegroundColor Yellow
+                        }
+                        elseif ($newUrl -notmatch '^https?://\S+$') {
+                            Write-Host 'Invalid URL. It must start with http:// or https://.' -ForegroundColor Yellow
+                        }
+                        else {
+                            $saved[$name] = $newUrl
+                            Update-ReleaseInfoSection -File $ReleaseInfoFile -Section 'api-urls' -Entries $saved
+                            Write-Host ("Saved '{0}' -> {1}" -f $name, $newUrl) -ForegroundColor Green
+                            if ((Read-Host 'Point API_URL to it now? (y/n)') -eq 'y') {
+                                $url = $newUrl
+                            }
+                        }
+                    }
+                    elseif ($subChoice.Key -eq 'Remove') {
+                        $removeOptions = @($saved.Keys | Sort-Object | ForEach-Object {
+                            [pscustomobject]@{ Name = $_; Label = "$_ -> $($saved[$_])" }
+                        })
+                        $toRemove = Show-ListPicker -Options $removeOptions -Title 'Which named URL should be removed?'
+                        if ($toRemove) {
+                            $saved.Remove($toRemove.Name)
+                            if ($saved.Count -eq 0) {
+                                Remove-ReleaseInfoSection -File $ReleaseInfoFile -Section 'api-urls'
+                            } else {
+                                Update-ReleaseInfoSection -File $ReleaseInfoFile -Section 'api-urls' -Entries $saved
+                            }
+                            Write-Host ("Removed '{0}'" -f $toRemove.Name) -ForegroundColor Green
+                        } else {
+                            Write-Host 'Cancelled. No changes made.' -ForegroundColor Yellow
+                        }
                     }
                     elseif ($subChoice.Key -eq 'Local') {
                         $url = 'http://127.0.0.1:8787'
@@ -1664,6 +1827,14 @@ try {
                     }
                     Write-Host "Updated [google-app-script] section in $ReleaseInfoFile" -ForegroundColor Green
 
+                    $doProxies = $UpdateProxies
+                    if (-not $doProxies -and -not $singleShot) {
+                        $doProxies = (Read-Host 'Update proxy/ and proxy_oppo/ to this deployment URL? (y/n)') -eq 'y'
+                    }
+                    if ($doProxies) {
+                        Update-ProxyTargets -Url $newDep.Url -ProxyPath $ProxyPath -ProxyOppoPath $ProxyOppoPath
+                    }
+
                     # Refresh the deployments list so the user sees the new version published in Apps Script.
                     Write-Host ''
                     Write-Host 'Current deployments (refreshed):' -ForegroundColor Cyan
@@ -1771,6 +1942,20 @@ try {
             }
             'ProxyDev' {
                 Start-LocalProxy -ProxyPath $ProxyPath -FrontendFile $FrontendFile
+            }
+            'SyncProxies' {
+                $items = @(Get-SortedDeployments -Path $BackendPath)
+                if ($items.Count -eq 0) {
+                    Write-Host "No Apps Script deployments available for $BackendPath." -ForegroundColor Yellow
+                    break
+                }
+                $choice = Show-Picker -Items $items -Title 'Pick the Apps Script deployment for proxy/ and proxy_oppo/'
+                if (-not $choice) {
+                    Write-Host 'Cancelled. No changes made.' -ForegroundColor Yellow
+                    break
+                }
+                Write-Host ("Target : {0}" -f $choice.Url) -ForegroundColor Cyan
+                Update-ProxyTargets -Url $choice.Url -ProxyPath $ProxyPath -ProxyOppoPath $ProxyOppoPath
             }
             'Seed' {
                 Invoke-SeedReleaseInfo -BackendPath $BackendPath -ProxyPath $ProxyPath -File $ReleaseInfoFile
